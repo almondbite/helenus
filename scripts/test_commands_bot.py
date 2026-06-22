@@ -84,7 +84,8 @@ def _market_state() -> MarketState:
 def _vanna() -> flow.VannaReading:
     return flow.VannaReading(
         vix_change=-0.70, vix_falling=True, otm_call_flow=6200, otm_put_flow=1100,
-        call_flow_dominance=5100, active=True, label="VANNA RALLY BUILDING",
+        call_flow_dominance=5100, active=True, bearish_active=False,
+        label="VANNA RALLY BUILDING",
         note=("VIX -0.70 (falling) with fresh OTM call flow 6,200 vs put 1,100 "
               "(5.6x) — cheaper calls drawing buyers; dealer hedging supports spot."),
     )

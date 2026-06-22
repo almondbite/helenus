@@ -149,6 +149,29 @@ def test_daily_reset_does_not_fake_a_surge() -> None:
     assert reading.active is False
 
 
+def test_put_flow_pressure_when_vix_rises_and_put_flow_dominates() -> None:
+    # Bearish mirror of the vanna rally: VIX rising + a surge in OTM put flow.
+    prev = _chain(spot=5000.0, calls=[(5040.0, 500)], puts=[(4960.0, 1000)])
+    curr = _chain(spot=5000.0, calls=[(5040.0, 800)], puts=[(4960.0, 4000)])
+    tracker = VannaTracker()
+    tracker.update(build_volume_profile(prev), _VIX_RISING)
+    reading = tracker.update(build_volume_profile(curr), _VIX_RISING)
+    assert _approx(reading.otm_put_flow, 3000)
+    assert _approx(reading.otm_call_flow, 300)
+    assert reading.bearish_active is True
+    assert reading.active is False                  # not the bullish setup
+    assert "PUT FLOW" in reading.label.upper()
+
+
+def test_put_flow_quiet_when_vix_not_rising() -> None:
+    prev = _chain(spot=5000.0, calls=[(5040.0, 500)], puts=[(4960.0, 1000)])
+    curr = _chain(spot=5000.0, calls=[(5040.0, 800)], puts=[(4960.0, 4000)])
+    tracker = VannaTracker()
+    tracker.update(build_volume_profile(prev), _VIX_FALLING)
+    reading = tracker.update(build_volume_profile(curr), _VIX_FALLING)
+    assert reading.bearish_active is False          # put flow there, VIX isn't
+
+
 # --------------------------------------------------------------------------- #
 # Standalone runner (no pytest required)
 # --------------------------------------------------------------------------- #

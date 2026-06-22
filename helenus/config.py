@@ -84,6 +84,12 @@ class ScanConfig:
     # relevant side. This is what separates a real range-edge reversal from
     # price merely pinning an interior GEX wall it hovers on all session.
     edge_proximity_pts: float = 10.0
+    # Range-expansion (momentum) trigger: fire when net displacement over the
+    # lookback exceeds `expansion_atr_mult` × mean bar range AND an absolute floor
+    # — a directional thrust between levels that the level-based triggers miss.
+    expansion_lookback_bars: int = 5
+    expansion_atr_mult: float = 3.0
+    expansion_min_pts: float = 10.0     # absolute floor so range-chop doesn't trip it
     bar_seconds: int = 60               # sequential interval size
     gex_cluster_proximity_pts: float = 10.0  # confluence credit distance
 

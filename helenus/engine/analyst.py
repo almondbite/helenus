@@ -17,6 +17,7 @@ instead of re-paying for it each time.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 from typing import Any
@@ -51,12 +52,22 @@ HOW TO READ THE DATA YOU ARE GIVEN
   is the regime pivot.
 - Call walls = gamma resistance (price tends to pin/reject below). Put walls = \
   gamma support. Proximity of spot to a wall is high-information confluence.
-- Key levels: round-number grid, prior close, session high/low. A reaction *at* \
-  a level matters more than one in open air.
+- Key levels: round-number grid, prior close, session high/low, session VWAP. A \
+  reaction *at* a level matters more than one in open air.
+- VWAP: the session's volume-weighted average price and the day's gravity line. \
+  Whether spot is above or below it is the default intraday bias (above = buyers \
+  in control, below = sellers); first tags of VWAP from one side often react, and \
+  a decisive reclaim/loss of VWAP on volume is a genuine momentum shift. The \
+  `vwap` block gives value, distance, and side.
 - SPY-proxy volume: SPX prints no volume, so this ratio is an SPY delta vs a \
   20-bar baseline. >1 means participation is picking up; conviction, not proof.
 - Trend: close vs the 20-bar mean. "With trend" setups are higher quality than \
   counter-trend ones; say so.
+- Session phase / clock: the `session` block gives the time, the phase \
+  (OPENING_DRIVE / MORNING_TREND / MIDDAY_LULL / AFTERNOON / POWER_HOUR), and the \
+  day's range so far. Weight it — opening-drive and power-hour moves trend and \
+  expand (give breaks more benefit of the doubt); MIDDAY_LULL setups fade more \
+  and need tighter confluence to be worth an alert.
 
 OPTIONS FLOW & THE VANNA RALLY — WEIGHT THIS HEAVILY
 This is one of your single most important inputs. You are given 0DTE option \
@@ -74,8 +85,13 @@ below spot, plus a live vanna reading.
   because that is the classic reversal: sellers exhaust, VIX rolls over, call \
   flow + dealer hedging snaps price back up. A falling market with an active \
   vanna setup is a high-conviction long signal, not a reason to stay bearish.
-- Conversely, do not call a bottom on a weak tape WITHOUT a vanna/flow tailwind; \
-  say what's missing.
+- PUT-FLOW PRESSURE (the bearish mirror): when VIX *rises*, puts are the demand — \
+  buyers pile into OTM puts and dealers short those puts hedge by SELLING the \
+  underlying, pressuring spot down. `vanna.bearish_active` flags this (`vix \
+  rising` + OTM put flow outpacing call flow); treat it as a strong bearish \
+  influence, especially into a rally that's stalling at resistance.
+- Conversely, do not call a bottom on a weak tape WITHOUT a vanna/flow tailwind, \
+  or a top on a strong tape without put-flow/VIX confirmation; say what's missing.
 
 YOUR JOB
 A cheap mechanical gate already fired — an event happened (a level cross, a \
@@ -153,6 +169,20 @@ def _macro_board(macro: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _session_phase(t: dt.time) -> str:
+    """The 0DTE day has distinct regimes; which one we're in shapes how a setup
+    should be read (open-drive trends, lunch chops, power-hour expands)."""
+    if t < dt.time(10, 0):
+        return "OPENING_DRIVE"
+    if t < dt.time(11, 30):
+        return "MORNING_TREND"
+    if t < dt.time(14, 0):
+        return "MIDDAY_LULL"
+    if t < dt.time(15, 0):
+        return "AFTERNOON"
+    return "POWER_HOUR"
+
+
 def _flow_block(vp: VolumeProfile | None, vanna: VannaReading | None) -> dict[str, Any]:
     """The options-flow + vanna section — Claude's highest-weight input."""
     if vp is None:
@@ -173,6 +203,7 @@ def _flow_block(vp: VolumeProfile | None, vanna: VannaReading | None) -> dict[st
     if vanna is not None:
         block["vanna"] = {
             "active": vanna.active,
+            "bearish_active": vanna.bearish_active,
             "label": vanna.label,
             "vix_change": vanna.vix_change,
             "vix_falling": vanna.vix_falling,
@@ -214,8 +245,27 @@ def _snapshot(
         for b in list(state.bars)[-CONFIG.analyst.recent_bars:]
     ]
     trend = state.trend_direction()
+    vwap = state.vwap()
+    last_ts = state.bars[-1].ts if state.bars else None
+    hi, lo = state.session_high, state.session_low
+    session = {
+        "time_et": last_ts.strftime("%H:%M") if last_ts else None,
+        "phase": _session_phase(last_ts.time()) if last_ts else None,
+        "high": round(hi, 2) if hi > -1e17 else None,
+        "low": round(lo, 2) if lo < 1e17 else None,
+        "range_pts": round(hi - lo, 2) if (hi > -1e17 and lo < 1e17) else None,
+        "bars_since_open": len(state.bars),
+    }
     return {
         "spot": round(spot, 2),
+        "session": session,
+        "vwap": {
+            "value": round(vwap, 2),
+            "dist_pts": round(spot - vwap, 2),
+            "side": "above" if spot >= vwap else "below",
+        }
+        if vwap == vwap  # not NaN
+        else None,
         "gex": {
             "regime": profile.regime,
             "zero_gamma": round(profile.zero_gamma, 1)

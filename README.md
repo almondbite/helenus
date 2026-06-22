@@ -33,19 +33,23 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    split ITM/OTM around spot) and runs the **vanna-rally tracker** (see below).
 4. `engine/scan2.py` keeps the rolling bar tape + key-level grid and runs
    `detect_candidate` — a cheap gate that only decides whether a bar is *worth a
-   Claude call*. It watches for an active vanna setup, a liquidity sweep, a
-   **level rejection** (price probes a level at the *edge* of the session range
-   and is turned away within the bar — the range-day reversal), or a level cross
-   on volume. The key-level grid includes the round-number grid, prior close,
-   session high/low, **and the GEX walls + zero-gamma flip** so reactions fire at
-   real dealer structure, not just round numbers. Rejections only count near the
-   running session extreme (`edge_proximity_pts`), so an interior wall price
-   *pins* doesn't spam — and the bot further debounces candidates per
+   Claude call*. It watches, highest-information first, for: a **flow setup**
+   (bullish vanna rally, or its bearish mirror **put-flow pressure**), a
+   **regime flip** (spot crossing the zero-gamma pivot), a **liquidity sweep**, a
+   **level rejection** (probe-and-reverse at the *edge* of the session range —
+   the range-day reversal), a **range-expansion** thrust between levels (the
+   trend-day momentum signal), or a **level cross on volume**. The key-level grid
+   includes the round-number grid, prior close, session high/low, **session
+   VWAP**, **and the GEX walls + zero-gamma flip** so reactions fire at real
+   structure, not just round numbers. Rejections only count near the running
+   session extreme (`edge_proximity_pts`), so an interior wall price *pins*
+   doesn't spam — and the bot further debounces candidates per
    trigger+level (`CANDIDATE_COOLDOWN_SECS`).
 5. `engine/analyst.py` hands Claude the structured snapshot (options flow + vanna,
-   GEX regime, walls, tape, levels, macro) and gets back a typed verdict via
-   structured outputs: `has_signal`, `direction`, `confidence`, `thesis`,
-   `risk_flags`. Claude may answer `has_signal=false` and stay quiet.
+   GEX regime, walls, tape, levels, VWAP, session phase / time-of-day, macro) and
+   gets back a typed verdict via structured outputs: `has_signal`, `direction`,
+   `confidence`, `thesis`, `risk_flags`. Claude may answer `has_signal=false` and
+   stay quiet.
 6. `output/embeds.py` renders the `Signal` to a color-coded Discord embed.
 
 ## The vanna rally (the edge)

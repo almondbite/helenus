@@ -89,21 +89,21 @@ def test_key_levels_injects_walls_and_zero_gamma() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_volume_cross_fires_on_a_put_wall_off_grid() -> None:
-    # Put wall at 7443 — not on the 10-pt round grid. Spot crosses it down on
-    # elevated volume. Pre-fix this level didn't exist, so nothing tripped.
-    st = MarketState(prior_close=7500.0)
-    base = [_bar(7448.0, v=100.0) for _ in range(21)]  # build the volume baseline
-    for b in base:
-        st.push_bar(b)
-    # 4x the 100-vol baseline, closes 7441 (crosses 7443 down); the wick to
-    # 7438 keeps session-low off 7441 so the put wall is the level that matches.
-    st.push_bar(_bar(7441.0, l=7438.0, v=400.0))
+    # Put wall at 7452 (off the 10-pt grid). Price crosses it UP on 4x volume in
+    # a band clear of round numbers, session extremes, and VWAP — so the wall is
+    # the level that matches. Pre-fix it wasn't a crossable level at all.
+    st = MarketState()
+    st.push_bar(_bar(7462.0, h=7462.0, l=7444.0, v=100.0))  # session high 7462
+    st.push_bar(_bar(7432.0, h=7448.0, l=7432.0, v=100.0))  # session low 7432
+    for _ in range(19):
+        st.push_bar(_bar(7445.0, v=100.0))                   # VWAP gravity ~7447
+    st.push_bar(_bar(7451.0, v=100.0))                       # prev: just below wall
+    st.push_bar(_bar(7453.0, v=400.0))                       # cur: crosses 7452 up
 
-    gex = _gex(spot=7441.0, put_walls=[(7443.0, -4e8)])
-    cand = detect_candidate(st, gex)
+    cand = detect_candidate(st, _gex(spot=7453.0, put_walls=[(7452.0, -4e8)]))
     assert cand is not None
     assert cand.trigger is TriggerType.VOLUME_CONFIRMATION
-    assert "Put Wall 7443" in cand.reason
+    assert "Put Wall 7452" in cand.reason
 
 
 # --------------------------------------------------------------------------- #
@@ -218,6 +218,96 @@ def test_volume_baseline_warms_up_early() -> None:
     assert st.volume_baseline() == 100.0
     st.push_bar(_bar(7475.0, v=300.0))
     assert abs(st.volume_ratio() - 3.0) < 1e-9
+
+
+# --------------------------------------------------------------------------- #
+# REGIME_FLIP — spot crosses the zero-gamma pivot
+# --------------------------------------------------------------------------- #
+
+def test_regime_flip_crossing_up() -> None:
+    st = MarketState()
+    st.push_bar(_bar(7405.0))                 # below zero-Γ
+    st.push_bar(_bar(7415.0))                 # crosses up through 7410
+    cand = detect_candidate(st, _gex(spot=7415.0, zero_gamma=7410.0))
+    assert cand is not None
+    assert cand.trigger is TriggerType.REGIME_FLIP
+    assert "up" in cand.reason and "POSITIVE_GAMMA" in cand.reason
+
+
+def test_regime_flip_crossing_down() -> None:
+    st = MarketState()
+    st.push_bar(_bar(7415.0))
+    st.push_bar(_bar(7405.0))                 # crosses down through 7410
+    cand = detect_candidate(st, _gex(spot=7405.0, zero_gamma=7410.0))
+    assert cand is not None
+    assert cand.trigger is TriggerType.REGIME_FLIP
+    assert "down" in cand.reason and "NEGATIVE_GAMMA" in cand.reason
+
+
+def test_no_regime_flip_without_a_cross() -> None:
+    st = MarketState()
+    st.push_bar(_bar(7420.0))
+    st.push_bar(_bar(7425.0))                 # both stay above zero-Γ
+    cand = detect_candidate(st, _gex(spot=7425.0, zero_gamma=7410.0))
+    assert cand is None or cand.trigger is not TriggerType.REGIME_FLIP
+
+
+# --------------------------------------------------------------------------- #
+# RANGE_EXPANSION — a directional thrust between levels
+# --------------------------------------------------------------------------- #
+
+def test_range_expansion_on_a_thrust() -> None:
+    st = MarketState()
+    for _ in range(10):                       # calm bars -> low ATR (~1.0)
+        st.push_bar(_bar(7500.0, h=7500.5, l=7499.5))
+    for px in (7497.0, 7493.0, 7489.0, 7486.0, 7483.0):  # ~17pt drop over 5 bars
+        st.push_bar(_bar(px, h=px + 0.5, l=px - 0.5))
+    cand = detect_candidate(st, _gex(spot=7483.0, zero_gamma=7600.0))
+    assert cand is not None
+    assert cand.trigger is TriggerType.RANGE_EXPANSION
+    assert "down-thrust" in cand.reason
+
+
+def test_no_expansion_on_chop() -> None:
+    st = MarketState()
+    for i in range(15):                       # oscillate ±1, net displacement ~0
+        px = 7500.0 + (1.0 if i % 2 else -1.0)
+        st.push_bar(_bar(px, h=px + 1.0, l=px - 1.0))
+    cand = detect_candidate(st, _gex(spot=st.bars[-1].close, zero_gamma=7600.0))
+    assert cand is None or cand.trigger is not TriggerType.RANGE_EXPANSION
+
+
+# --------------------------------------------------------------------------- #
+# VWAP
+# --------------------------------------------------------------------------- #
+
+def test_vwap_weights_typical_price_by_volume() -> None:
+    st = MarketState()
+    st.push_bar(_bar(100.0, h=110.0, l=90.0, v=100.0))   # typical 100, vol 100
+    st.push_bar(_bar(200.0, h=220.0, l=180.0, v=300.0))  # typical 200, vol 300
+    # (100*100 + 200*300) / (100+300) = 70000/400 = 175
+    assert abs(st.vwap() - 175.0) < 1e-9
+
+
+def test_vwap_is_nan_without_volume() -> None:
+    st = MarketState()
+    st.push_bar(_bar(100.0, v=0.0))
+    assert st.vwap() != st.vwap()  # NaN
+
+
+def test_vwap_is_a_weighted_key_level() -> None:
+    st = MarketState()
+    st.push_bar(_bar(100.0, h=110.0, l=90.0, v=100.0))
+    by_label = {lv.label: lv for lv in st.key_levels(100.0)}
+    assert "VWAP" in by_label
+    assert by_label["VWAP"].weight == 0.85
+    assert abs(by_label["VWAP"].price - 100.0) < 1e-9
+
+
+def test_no_vwap_level_before_any_volume() -> None:
+    st = MarketState()
+    st.push_bar(_bar(100.0, v=0.0))
+    assert "VWAP" not in {lv.label for lv in st.key_levels(100.0)}
 
 
 # --------------------------------------------------------------------------- #

@@ -158,7 +158,8 @@ class VannaReading:
     otm_call_flow: float             # fresh OTM call volume this interval
     otm_put_flow: float              # fresh OTM put volume this interval
     call_flow_dominance: float       # otm_call_flow - otm_put_flow
-    active: bool                     # the vanna-rally setup is live
+    active: bool                     # the bullish vanna-rally setup is live
+    bearish_active: bool             # the bearish analogue (put-flow pressure) is live
     label: str
     note: str
 
@@ -191,12 +192,21 @@ class VannaTracker:
             k = min(len(vix_history) - 1, cfg.vix_lookback_samples)
             vix_change = float(vix_history[-1] - vix_history[-1 - k])
         vix_falling = vix_change <= -cfg.vix_drop_pts
+        vix_rising = vix_change >= cfg.vix_drop_pts
 
         dominance = otm_call_flow - otm_put_flow
         active = (
             vix_falling
             and otm_call_flow >= cfg.min_call_flow
             and otm_call_flow >= cfg.call_dominance_ratio * max(otm_put_flow, 1.0)
+        )
+        # Bearish analogue: VIX rising makes puts the demand, buyers pile into OTM
+        # puts, dealers short those puts hedge by SELLING the underlying — vanna
+        # pressure to the downside. Symmetric thresholds to the rally.
+        bearish_active = (
+            vix_rising
+            and otm_put_flow >= cfg.min_call_flow
+            and otm_put_flow >= cfg.call_dominance_ratio * max(otm_call_flow, 1.0)
         )
 
         if active:
@@ -207,14 +217,28 @@ class VannaTracker:
                 f"({otm_call_flow / max(otm_put_flow, 1.0):.1f}x) — cheaper calls "
                 "drawing buyers; dealer hedging supports spot."
             )
+        elif bearish_active:
+            label = "PUT FLOW PRESSURE"
+            note = (
+                f"VIX {vix_change:+.2f} (rising) with fresh OTM put flow "
+                f"{otm_put_flow:,.0f} vs call {otm_call_flow:,.0f} "
+                f"({otm_put_flow / max(otm_call_flow, 1.0):.1f}x) — put demand; "
+                "dealer hedging pressures spot lower."
+            )
         elif vix_falling and dominance > 0:
             label = "vanna leaning bullish"
             note = (
                 f"VIX {vix_change:+.2f}, OTM call flow leading puts "
                 f"({otm_call_flow:,.0f} vs {otm_put_flow:,.0f}) but below trigger."
             )
+        elif vix_rising and dominance < 0:
+            label = "leaning bearish"
+            note = (
+                f"VIX {vix_change:+.2f}, OTM put flow leading calls "
+                f"({otm_put_flow:,.0f} vs {otm_call_flow:,.0f}) but below trigger."
+            )
         else:
-            label = "no vanna setup"
+            label = "no flow setup"
             note = f"VIX {vix_change:+.2f}; OTM call flow {otm_call_flow:,.0f} vs put {otm_put_flow:,.0f}."
 
         return VannaReading(
@@ -224,6 +248,7 @@ class VannaTracker:
             otm_put_flow=otm_put_flow,
             call_flow_dominance=dominance,
             active=active,
+            bearish_active=bearish_active,
             label=label,
             note=note,
         )

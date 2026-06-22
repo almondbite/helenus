@@ -500,8 +500,10 @@ class HelenusBot(commands.Bot):
         posted = await self._post(
             embeds.signal_embed(sig, self.profile, self.vol_profile, self.vanna_reading)
         )
-        # A vanna-driven call is about the volume distribution — show the breakdown.
-        if posted and sig.trigger is TriggerType.VANNA_RALLY and self.vol_profile is not None:
+        # A flow-driven call (vanna rally or put-flow pressure) is about the
+        # volume distribution — attach the breakdown.
+        flow_triggers = (TriggerType.VANNA_RALLY, TriggerType.PUT_FLOW)
+        if posted and sig.trigger in flow_triggers and self.vol_profile is not None:
             await self._post(
                 embeds.volume_profile_embed(self.vol_profile, self.vanna_reading)
             )

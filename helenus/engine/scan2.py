@@ -15,10 +15,14 @@ Candidate patterns the gate watches:
   * LEVEL_REJECTION — spot probes a high-value level (session extreme, prior
     close, GEX wall, zero-Γ) and is turned away within the bar, leaving a
     rejection wick. The range-day reversal the deep-pierce sweep test misses.
+  * RANGE_EXPANSION — a directional thrust between levels (net displacement over
+    the lookback clears an ATR multiple); the trend-day momentum signal.
+  * REGIME_FLIP — spot crosses the zero-gamma pivot (mean-revert ↔ expansion).
+  * VANNA_RALLY / PUT_FLOW — options-flow events (VIX + OTM call/put flow).
   * PREMARKET_SETUP — handled directly by the analyst before the open.
 
 Key levels tracked: round-number grid, prior-day close, session high/low,
-plus GEX walls injected from the gamma engine for confluence.
+session VWAP, plus GEX walls injected from the gamma engine for confluence.
 """
 
 from __future__ import annotations
@@ -49,8 +53,11 @@ class TriggerType(Enum):
     VOLUME_CONFIRMATION = "Volume Confirmation"
     SWEEP_RECOVER = "Sweep & Recover"
     LEVEL_REJECTION = "Level Rejection"
+    RANGE_EXPANSION = "Range Expansion"
+    REGIME_FLIP = "Regime Flip"
     PREMARKET_SETUP = "Pre-Market Setup"
     VANNA_RALLY = "Vanna Rally"
+    PUT_FLOW = "Put Flow Pressure"
 
 
 @dataclass(frozen=True)
@@ -102,11 +109,19 @@ class MarketState:
         self.bars: deque[Bar] = deque(maxlen=max(CONFIG.scan.volume_ma_periods * 3, 120))
         self.session_high: float = -np.inf
         self.session_low: float = np.inf
+        # Session-cumulative typical-price×volume and volume, for VWAP. These run
+        # over the whole session (not the bounded `bars` deque), so VWAP stays
+        # correct even after old bars roll off — reset only by a new session.
+        self._cum_pv: float = 0.0
+        self._cum_vol: float = 0.0
 
     def push_bar(self, bar: Bar) -> None:
         self.bars.append(bar)
         self.session_high = max(self.session_high, bar.high)
         self.session_low = min(self.session_low, bar.low)
+        typical = (bar.high + bar.low + bar.close) / 3.0
+        self._cum_pv += typical * bar.volume
+        self._cum_vol += bar.volume
 
     # -- baselines --------------------------------------------------------- #
 
@@ -133,6 +148,16 @@ class MarketState:
             return float("nan")
         return self.bars[-1].volume / base
 
+    def atr(self, n: int | None = None) -> float:
+        """Mean bar range (high-low) over the last n bars, excluding the current
+        forming one — a cheap ATR for the range-expansion trigger. NaN until warm."""
+        n = n or CONFIG.scan.volume_ma_periods
+        priors = list(self.bars)[:-1]
+        if len(priors) < CONFIG.scan.min_baseline_bars:
+            return float("nan")
+        window = priors[-n:]
+        return float(np.mean([b.high - b.low for b in window]))
+
     def realized_range_5m(self) -> float:
         """Spot range over the last ~5 minutes — fed back to the throttle."""
         secs = CONFIG.scan.bar_seconds
@@ -141,6 +166,13 @@ class MarketState:
         if not recent:
             return 0.0
         return max(b.high for b in recent) - min(b.low for b in recent)
+
+    def vwap(self) -> float:
+        """Session VWAP from typical price weighted by SPY-proxy volume. NaN until
+        any volume has accumulated. The single most-watched 0DTE reference."""
+        if self._cum_vol <= 0:
+            return float("nan")
+        return self._cum_pv / self._cum_vol
 
     def trend_direction(self) -> Direction | None:
         """Cheap structural trend: close vs 20-bar mean close."""
@@ -175,6 +207,9 @@ class MarketState:
             levels.append(KeyLevel(self.session_high, "Session High", weight=0.7))
         if np.isfinite(self.session_low):
             levels.append(KeyLevel(self.session_low, "Session Low", weight=0.7))
+        vwap = self.vwap()
+        if np.isfinite(vwap):
+            levels.append(KeyLevel(vwap, "VWAP", weight=0.85))
 
         # GEX structure — the highest-information levels the bot is built around.
         # Call/put walls are dealer-gamma resistance/support; zero-gamma is the
@@ -208,21 +243,48 @@ def detect_candidate(
 
     This makes no directional or confidence claim — that's the analyst's job.
     Priority order, highest-information first:
-      1. an active vanna-rally setup (VIX falling + OTM call flow surging),
-      2. a liquidity sweep (pierce-and-reclaim of a key level),
-      3. a rejection at a high-value level (touch-and-reverse off a session
+      1. an active flow setup — vanna rally (VIX falling + OTM call flow) or its
+         bearish analogue, put-flow pressure (VIX rising + OTM put flow),
+      2. a regime flip (spot crosses the zero-gamma pivot),
+      3. a liquidity sweep (pierce-and-reclaim of a key level),
+      4. a rejection at a high-value level (touch-and-reverse off a session
          extreme / GEX wall / zero-Γ),
-      4. a level cross on elevated volume.
+      5. a range-expansion thrust between levels (trend-day momentum),
+      6. a level cross on elevated volume.
     """
     # Vanna fires independent of the bar tape — it's an options-flow event and
-    # is the signal we most want Claude to weigh in on.
+    # is the signal we most want Claude to weigh in on. The bearish analogue
+    # (VIX rising + OTM put flow dominating) is dealer selling pressure.
     if vanna is not None and vanna.active:
         return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
+    if vanna is not None and vanna.bearish_active:
+        return Candidate(trigger=TriggerType.PUT_FLOW, level=None, reason=vanna.note)
 
     if gex is None or len(state.bars) < 2:
         return None
 
     cur = state.bars[-1]
+    prev = state.bars[-2]
+
+    # --- Regime flip: spot crosses the zero-gamma pivot ------------------ #
+    # Positive↔negative gamma is the biggest structural state change there is:
+    # dealers flip from damping moves (mean-reversion) to amplifying them
+    # (trend/expansion), or vice-versa. Highest-priority bar-driven event.
+    if gex.zero_gamma is not None:
+        zg = float(gex.zero_gamma)
+        crossed_up = prev.close < zg <= cur.close
+        crossed_dn = prev.close > zg >= cur.close
+        if crossed_up or crossed_dn:
+            regime = (
+                "POSITIVE_GAMMA (mean-revert)" if crossed_up
+                else "NEGATIVE_GAMMA (expansion)"
+            )
+            return Candidate(
+                trigger=TriggerType.REGIME_FLIP,
+                level=KeyLevel(zg, "Zero-Γ", 0.9),
+                reason=f"Crossed zero-gamma {zg:.0f} "
+                f"{'up' if crossed_up else 'down'} — regime now {regime}",
+            )
 
     # --- Sweep & recover (needs 3 bars) ---------------------------------- #
     if len(state.bars) >= 3:
@@ -317,8 +379,27 @@ def detect_candidate(
                     f"({side}); closed {cur.close:.2f}",
                 )
 
+    # --- Range expansion / momentum thrust ------------------------------- #
+    # A directional push that the level-based triggers miss because it happens
+    # between levels — the trend-day signal. Net displacement over the lookback
+    # must clear both an ATR multiple and an absolute point floor.
+    atr = state.atr()
+    k = CONFIG.scan.expansion_lookback_bars
+    if np.isfinite(atr) and atr > 0 and len(state.bars) > k:
+        disp = cur.close - state.bars[-1 - k].close
+        if (
+            abs(disp) >= CONFIG.scan.expansion_min_pts
+            and abs(disp) >= CONFIG.scan.expansion_atr_mult * atr
+        ):
+            d = "up" if disp > 0 else "down"
+            return Candidate(
+                trigger=TriggerType.RANGE_EXPANSION,
+                level=None,
+                reason=f"{abs(disp):.1f}pt {d}-thrust over {k} bars "
+                f"({abs(disp) / atr:.1f}× ATR)",
+            )
+
     # --- Level cross on elevated volume ---------------------------------- #
-    prev = state.bars[-2]
     ratio = state.volume_ratio()
     if np.isfinite(ratio) and ratio >= CONFIG.analyst.gate_volume_ratio:
         for level in state.key_levels(cur.close, gex):
