@@ -1,4 +1,4 @@
-# --- Secrets / credentials ---
+# --- Credentials ---
 .env
 .env.*
 !.env.example
@@ -55,6 +55,8 @@ htmlcov/
 logs/
 *.sqlite
 *.db
+journal/
+*.jsonl
 
 # --- OS junk ---
 .DS_Store

@@ -1,16 +1,24 @@
 """
-scan2 — the mechanical scan engine. Pure state machine: feed it bars and a
-GexProfile, it emits Signal objects (or nothing). No I/O, no awaits.
+scan2 — the mechanical *candidate* layer. Pure, no I/O, no awaits.
 
-Triggers:
-  1. VOLUME_CONFIRMATION — spot crosses a key structural level on >= 2.0x
-     the 20-period volume baseline.
-  2. SWEEP_RECOVER — spot pierces a key level intra-bar, then the very next
-     sequential bar closes back on the original side (liquidity sweep).
-  3. PREMARKET_SETUP — overnight futures location vs VIX bands and /CL trend.
+This module no longer renders verdicts. It computes the rolling intraday tape
+(MarketState), the key-level grid, and a cheap gate (`detect_candidate`) that
+decides *when* a bar is interesting enough to spend a Claude call on. The
+judgment — direction, confidence, thesis — is made downstream in
+`helenus.engine.analyst`. The `Signal` dataclass here is the shared shape both
+layers speak; Claude fills it in.
+
+Candidate patterns the gate watches:
+  * VOLUME_CONFIRMATION — spot crosses a key structural level on elevated volume.
+  * SWEEP_RECOVER — spot pierces a key level intra-bar, then the very next
+    sequential bar closes back on the original side (liquidity sweep).
+  * LEVEL_REJECTION — spot probes a high-value level (session extreme, prior
+    close, GEX wall, zero-Γ) and is turned away within the bar, leaving a
+    rejection wick. The range-day reversal the deep-pierce sweep test misses.
+  * PREMARKET_SETUP — handled directly by the analyst before the open.
 
 Key levels tracked: round-number grid, prior-day close, session high/low,
-plus GEX walls injected from the gamma engine for confluence scoring.
+plus GEX walls injected from the gamma engine for confluence.
 """
 
 from __future__ import annotations
@@ -20,11 +28,16 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 
 from helenus.config import CONFIG
 from helenus.engine.gex import GexProfile
+
+if TYPE_CHECKING:
+    from helenus.engine.flow import VannaReading
 
 
 class Direction(Enum):
@@ -35,7 +48,9 @@ class Direction(Enum):
 class TriggerType(Enum):
     VOLUME_CONFIRMATION = "Volume Confirmation"
     SWEEP_RECOVER = "Sweep & Recover"
+    LEVEL_REJECTION = "Level Rejection"
     PREMARKET_SETUP = "Pre-Market Setup"
+    VANNA_RALLY = "Vanna Rally"
 
 
 @dataclass(frozen=True)
@@ -62,9 +77,17 @@ class Signal:
     level: KeyLevel | None
     spot: float
     volume_ratio: float
-    confidence: float           # 0..100
+    confidence: float           # 0..100, assigned by Claude
     trend_label: str            # e.g. "BULLISH WITH TREND"
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A bar the gate flagged as worth a Claude call. Not a verdict."""
+    trigger: TriggerType
+    level: KeyLevel | None
+    reason: str                 # human-readable description of what tripped
 
 
 # --------------------------------------------------------------------------- #
@@ -88,12 +111,21 @@ class MarketState:
     # -- baselines --------------------------------------------------------- #
 
     def volume_baseline(self) -> float:
-        """Rolling 20-period simple MA of interval volume (excl. current bar)."""
+        """Mean interval volume over the trailing window (excl. the current bar).
+
+        Uses the full 20-period window once warm, but falls back to whatever
+        history exists (down to `min_baseline_bars` priors) during the opening
+        ramp — otherwise the first ~20 minutes are structurally un-alertable,
+        which is exactly when session-defining breaks (e.g. the open-drive high
+        rejection) happen.
+        """
         n = CONFIG.scan.volume_ma_periods
-        if len(self.bars) < n + 1:
+        priors = len(self.bars) - 1  # exclude the current (forming) bar
+        if priors < CONFIG.scan.min_baseline_bars:
             return float("nan")
+        window = min(n, priors)
         vols = pd.Series([b.volume for b in self.bars])
-        return float(vols.iloc[-(n + 1):-1].mean())
+        return float(vols.iloc[-(window + 1):-1].mean())
 
     def volume_ratio(self) -> float:
         base = self.volume_baseline()
@@ -126,7 +158,7 @@ class MarketState:
 
     # -- levels ------------------------------------------------------------ #
 
-    def key_levels(self, spot: float) -> list[KeyLevel]:
+    def key_levels(self, spot: float, gex: GexProfile | None = None) -> list[KeyLevel]:
         levels: list[KeyLevel] = []
         step = CONFIG.scan.round_number_step
         major = CONFIG.scan.major_round_step
@@ -143,180 +175,161 @@ class MarketState:
             levels.append(KeyLevel(self.session_high, "Session High", weight=0.7))
         if np.isfinite(self.session_low):
             levels.append(KeyLevel(self.session_low, "Session Low", weight=0.7))
+
+        # GEX structure — the highest-information levels the bot is built around.
+        # Call/put walls are dealer-gamma resistance/support; zero-gamma is the
+        # regime pivot. These are what a range-day reaction most often happens at.
+        if gex is not None:
+            for strike, _net in gex.call_walls:
+                levels.append(
+                    KeyLevel(float(strike), f"Call Wall {strike:.0f}", weight=0.85)
+                )
+            for strike, _net in gex.put_walls:
+                levels.append(
+                    KeyLevel(float(strike), f"Put Wall {strike:.0f}", weight=0.85)
+                )
+            if gex.zero_gamma is not None:
+                levels.append(KeyLevel(float(gex.zero_gamma), "Zero-Γ", weight=0.9))
         return levels
 
 
 # --------------------------------------------------------------------------- #
-# Confidence scoring
+# Candidate gate
 # --------------------------------------------------------------------------- #
 
-def _confidence(
-    volume_ratio: float,
-    level: KeyLevel | None,
+def detect_candidate(
+    state: MarketState,
     gex: GexProfile | None,
-    spot: float,
-    direction: Direction,
-    trend: Direction | None,
-) -> tuple[float, str]:
+    vanna: "VannaReading | None" = None,
+) -> Candidate | None:
     """
-    Confluence model, capped at 95 — scan2 never claims certainty.
+    Cheap attention gate: is the latest bar interesting enough to spend a Claude
+    call on? Returns a Candidate describing what tripped, or None.
 
-      volume component   : up to 35 pts, saturates at 4x baseline
-      level weight       : up to 25 pts
-      GEX cluster prox.  : up to 20 pts, linear inside proximity window
-      trend alignment    : +15 with trend / +0 counter-trend
+    This makes no directional or confidence claim — that's the analyst's job.
+    Priority order, highest-information first:
+      1. an active vanna-rally setup (VIX falling + OTM call flow surging),
+      2. a liquidity sweep (pierce-and-reclaim of a key level),
+      3. a rejection at a high-value level (touch-and-reverse off a session
+         extreme / GEX wall / zero-Γ),
+      4. a level cross on elevated volume.
     """
-    score = 0.0
-    if np.isfinite(volume_ratio):
-        score += 35.0 * min(volume_ratio / 4.0, 1.0)
-    if level is not None:
-        score += 25.0 * level.weight
-    if gex is not None:
-        d = gex.nearest_cluster_distance(spot)
-        window = CONFIG.scan.gex_cluster_proximity_pts
-        if d <= window:
-            score += 20.0 * (1.0 - d / window)
+    # Vanna fires independent of the bar tape — it's an options-flow event and
+    # is the signal we most want Claude to weigh in on.
+    if vanna is not None and vanna.active:
+        return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
 
-    if trend is None:
-        trend_label = f"{direction.value} (NO TREND READ)"
-    elif trend == direction:
-        score += 15.0
-        trend_label = f"{direction.value} WITH TREND"
-    else:
-        trend_label = f"{direction.value} COUNTER-TREND"
-
-    return min(round(score, 1), 95.0), trend_label
-
-
-# --------------------------------------------------------------------------- #
-# Triggers
-# --------------------------------------------------------------------------- #
-
-def check_volume_confirmation(
-    state: MarketState, gex: GexProfile | None
-) -> Signal | None:
-    """Trigger 1: level cross on >= 2.0x volume."""
-    if len(state.bars) < 2:
+    if gex is None or len(state.bars) < 2:
         return None
-    prev, cur = state.bars[-2], state.bars[-1]
+
+    cur = state.bars[-1]
+
+    # --- Sweep & recover (needs 3 bars) ---------------------------------- #
+    if len(state.bars) >= 3:
+        before, pierce = state.bars[-3], state.bars[-2]
+        depth = CONFIG.scan.sweep_pierce_pts
+        for level in state.key_levels(cur.close, gex):
+            swept_low = (
+                before.close > level.price
+                and pierce.low <= level.price - depth
+                and cur.close > level.price
+            )
+            swept_high = (
+                before.close < level.price
+                and pierce.high >= level.price + depth
+                and cur.close < level.price
+            )
+            if swept_low or swept_high:
+                side = "below" if swept_low else "above"
+                return Candidate(
+                    trigger=TriggerType.SWEEP_RECOVER,
+                    level=level,
+                    reason=f"Swept {side} {level.label} @ {level.price:.2f}, reclaimed next bar",
+                )
+
+    # --- Rejection at a high-value level (touch & reverse) --------------- #
+    # The range-day bread-and-butter: spot probes a meaningful level (session
+    # extreme, prior close, GEX wall, zero-Γ) and is turned away within the bar,
+    # leaving a rejection wick. Unlike SWEEP_RECOVER this needs only the *current*
+    # bar and does NOT require a deep pierce-and-reclaim — a level that holds on
+    # the wick never trips the sweep test. Restricted to weighty levels and a
+    # real wick so midday chop stays quiet.
+    prox = CONFIG.scan.level_proximity_pts
+    wick = CONFIG.scan.rejection_wick_pts
+    bar_range = cur.high - cur.low
+    if bar_range >= wick:
+        # Session extremes are taken as they stood BEFORE this bar (a genuine
+        # retest of an established floor/ceiling). Otherwise a bar that merely
+        # prints a fresh new low and closes green would tautologically "reject
+        # off the session low." Walls / prior close keep first-touch semantics —
+        # they're real structure independent of the tape.
+        rej_levels = [
+            lv
+            for lv in state.key_levels(cur.close, gex)
+            if lv.weight >= CONFIG.scan.rejection_min_weight
+            and lv.label not in ("Session High", "Session Low")
+        ]
+        prior = list(state.bars)[:-1]
+        prior_low = min(b.low for b in prior)
+        prior_high = max(b.high for b in prior)
+        # Session extremes are taken as they stood BEFORE this bar (a genuine
+        # retest of an established floor/ceiling). Otherwise a bar that merely
+        # prints a fresh new low and closes green would tautologically "reject
+        # off the session low." Walls / prior close keep first-touch semantics.
+        rej_levels.append(KeyLevel(prior_low, "Session Low", weight=0.7))
+        rej_levels.append(KeyLevel(prior_high, "Session High", weight=0.7))
+        # Side is set by where price approached from (the prior close), so a
+        # level only acts as support when we're above it and resistance when
+        # below. Without this, a falling bar grazing the descending session low
+        # reads as a bogus "resistance rejection" — pure trend-continuation noise.
+        ref = state.bars[-2].close
+        edge = CONFIG.scan.edge_proximity_pts
+        for level in rej_levels:
+            # Edge gate: a support rejection must sit near the running floor, a
+            # resistance rejection near the running ceiling. An interior wall
+            # price is merely pinning is neither, so it never fires here.
+            near_floor = (level.price - prior_low) <= edge
+            near_ceiling = (prior_high - level.price) <= edge
+            # Bullish: wick down tags support from above, closes back over it.
+            held_support = (
+                near_floor
+                and level.price <= ref
+                and level.price - prox <= cur.low <= level.price + prox
+                and cur.close > cur.low
+                and cur.close >= level.price
+                and (cur.close - cur.low) >= wick
+            )
+            # Bearish: wick up tags resistance from below, closes back under it.
+            held_resist = (
+                near_ceiling
+                and level.price >= ref
+                and level.price - prox <= cur.high <= level.price + prox
+                and cur.close < cur.high
+                and cur.close <= level.price
+                and (cur.high - cur.close) >= wick
+            )
+            if held_support or held_resist:
+                side = "support" if held_support else "resistance"
+                return Candidate(
+                    trigger=TriggerType.LEVEL_REJECTION,
+                    level=level,
+                    reason=f"Rejected off {level.label} @ {level.price:.2f} "
+                    f"({side}); closed {cur.close:.2f}",
+                )
+
+    # --- Level cross on elevated volume ---------------------------------- #
+    prev = state.bars[-2]
     ratio = state.volume_ratio()
-    if not np.isfinite(ratio) or ratio < CONFIG.scan.volume_trigger_ratio:
-        return None
+    if np.isfinite(ratio) and ratio >= CONFIG.analyst.gate_volume_ratio:
+        for level in state.key_levels(cur.close, gex):
+            crossed_up = prev.close < level.price <= cur.close
+            crossed_dn = prev.close > level.price >= cur.close
+            if crossed_up or crossed_dn:
+                d = "up" if crossed_up else "down"
+                return Candidate(
+                    trigger=TriggerType.VOLUME_CONFIRMATION,
+                    level=level,
+                    reason=f"Crossed {level.label} @ {level.price:.2f} {d} on {ratio:.1f}x volume",
+                )
 
-    for level in state.key_levels(cur.close):
-        crossed_up = prev.close < level.price <= cur.close
-        crossed_dn = prev.close > level.price >= cur.close
-        if not (crossed_up or crossed_dn):
-            continue
-        direction = Direction.BULLISH if crossed_up else Direction.BEARISH
-        conf, trend_label = _confidence(
-            ratio, level, gex, cur.close, direction, state.trend_direction()
-        )
-        return Signal(
-            trigger=TriggerType.VOLUME_CONFIRMATION,
-            direction=direction,
-            level=level,
-            spot=cur.close,
-            volume_ratio=ratio,
-            confidence=conf,
-            trend_label=trend_label,
-            notes=[f"Crossed {level.label} @ {level.price:.2f} on {ratio:.1f}x volume"],
-        )
     return None
-
-
-def check_sweep_recover(state: MarketState, gex: GexProfile | None) -> Signal | None:
-    """
-    Trigger 2: bar N pierces a level by >= sweep_pierce_pts but the very next
-    bar (N+1, the current bar) closes back on the original side.
-    """
-    if len(state.bars) < 3:
-        return None
-    before, pierce, cur = state.bars[-3], state.bars[-2], state.bars[-1]
-    depth = CONFIG.scan.sweep_pierce_pts
-
-    for level in state.key_levels(cur.close):
-        # Sweep below support -> bullish reclaim
-        swept_low = (
-            before.close > level.price
-            and pierce.low <= level.price - depth
-            and cur.close > level.price
-        )
-        # Sweep above resistance -> bearish rejection
-        swept_high = (
-            before.close < level.price
-            and pierce.high >= level.price + depth
-            and cur.close < level.price
-        )
-        if not (swept_low or swept_high):
-            continue
-        direction = Direction.BULLISH if swept_low else Direction.BEARISH
-        ratio = state.volume_ratio()
-        conf, trend_label = _confidence(
-            ratio, level, gex, cur.close, direction, state.trend_direction()
-        )
-        side = "below" if swept_low else "above"
-        return Signal(
-            trigger=TriggerType.SWEEP_RECOVER,
-            direction=direction,
-            level=level,
-            spot=cur.close,
-            volume_ratio=ratio,
-            confidence=conf,
-            trend_label=trend_label,
-            notes=[f"Swept {side} {level.label} @ {level.price:.2f}, reclaimed next bar"],
-        )
-    return None
-
-
-def check_premarket_setup(
-    es_last: float,
-    es_prior_close: float,
-    vix_last: float,
-    vix_band: tuple[float, float],
-    cl_change_pct: float,
-) -> Signal:
-    """
-    Trigger 3: pre-market briefing. Always emits — the briefing itself is the
-    product; direction reflects the overnight balance of evidence.
-
-    Inputs:
-        es_last / es_prior_close : overnight futures location
-        vix_band                 : (low, high) recent VIX range boundaries
-        cl_change_pct            : /CL overnight % change (risk-tone proxy)
-    """
-    notes: list[str] = []
-    score = 0
-
-    es_pct = (es_last / es_prior_close - 1.0) * 100 if es_prior_close else 0.0
-    score += 1 if es_pct > 0 else -1
-    notes.append(f"Futures {es_pct:+.2f}% vs prior close")
-
-    vix_lo, vix_hi = vix_band
-    if vix_last <= vix_lo:
-        score += 1
-        notes.append(f"VIX {vix_last:.2f} at/below range low {vix_lo:.2f} — supportive")
-    elif vix_last >= vix_hi:
-        score -= 1
-        notes.append(f"VIX {vix_last:.2f} at/above range high {vix_hi:.2f} — defensive")
-    else:
-        notes.append(f"VIX {vix_last:.2f} mid-range ({vix_lo:.2f}–{vix_hi:.2f})")
-
-    if abs(cl_change_pct) >= 1.0:
-        score += 1 if cl_change_pct > 0 else -1
-        notes.append(f"/CL {cl_change_pct:+.2f}% overnight — macro tone driver")
-    else:
-        notes.append(f"/CL {cl_change_pct:+.2f}% — quiet")
-
-    direction = Direction.BULLISH if score >= 0 else Direction.BEARISH
-    confidence = min(40.0 + 15.0 * abs(score), 85.0)
-    return Signal(
-        trigger=TriggerType.PREMARKET_SETUP,
-        direction=direction,
-        level=None,
-        spot=es_last,
-        volume_ratio=float("nan"),
-        confidence=confidence,
-        trend_label=f"{direction.value} OVERNIGHT BIAS",
-        notes=notes,
-    )

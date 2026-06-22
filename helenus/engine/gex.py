@@ -111,9 +111,10 @@ def aggregate_gex(df: pd.DataFrame) -> pd.DataFrame:
         call_gex, put_gex, net_gex, volume, oi
     """
     if df.empty:
-        return pd.DataFrame(
-            columns=["call_gex", "put_gex", "net_gex", "volume", "oi"]
-        )
+        # Float-typed empty columns — object dtype would break the .nlargest /
+        # .nsmallest wall extraction in build_profile on an empty chain.
+        cols = ["call_gex", "put_gex", "net_gex", "volume", "oi"]
+        return pd.DataFrame({c: pd.Series(dtype=float) for c in cols})
     pivot = df.pivot_table(
         index="strikePrice",
         columns="side",

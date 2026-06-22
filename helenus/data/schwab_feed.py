@@ -3,7 +3,8 @@ Async ingestion layer over the Charles Schwab Developer API (schwab-py).
 
 Responsibilities:
   * Authenticate and hold a single schwab-py AsyncClient.
-  * Pull the $SPXW 0DTE chain (PM-settled weeklys — NOT the $SPX monthlies).
+  * Pull the 0DTE chain via the $SPX underlying, keeping only the PM-settled
+    SPXW contracts (NOT the AM-settled $SPX monthlies).
   * Pull macro quotes: /CL, /GC, $VIX, plus the SPY volume proxy.
   * Enforce adaptive throttling so we stay friendly with rate limits when
     nothing is moving.
@@ -23,6 +24,7 @@ from zoneinfo import ZoneInfo
 from schwab.auth import client_from_token_file
 
 from helenus.config import (
+    CHAIN_CONTRACT_ROOT,
     CHAIN_SYMBOL,
     CONFIG,
     MACRO_SYMBOLS,
@@ -33,6 +35,35 @@ from helenus.config import (
 )
 
 log = logging.getLogger("helenus.feed")
+
+
+def _filter_contract_root(payload: dict[str, Any], root: str) -> None:
+    """
+    Drop every contract whose symbol root isn't `root`, in place.
+
+    Schwab nests contracts as {expDateStr: {strikeStr: [contract, ...]}}. On the
+    monthly expiry the $SPX chain returns both PM-settled SPXW dailies and the
+    AM-settled SPX monthly under the same date key; keeping only the SPXW root
+    stops the two settlement regimes from being aggregated together. Empty
+    strike and expiration buckets are pruned so downstream flattening is clean.
+    """
+    for map_key in ("callExpDateMap", "putExpDateMap"):
+        exp_map = payload.get(map_key)
+        if not exp_map:
+            continue
+        for exp_key in list(exp_map):
+            strikes = exp_map[exp_key]
+            for strike_key in list(strikes):
+                kept = [
+                    c for c in strikes[strike_key]
+                    if str(c.get("symbol", "")).startswith(root)
+                ]
+                if kept:
+                    strikes[strike_key] = kept
+                else:
+                    del strikes[strike_key]
+            if not strikes:
+                del exp_map[exp_key]
 
 ET = ZoneInfo("America/New_York")
 
@@ -122,11 +153,12 @@ class SchwabFeed:
 
     async def fetch_0dte_chain(self) -> dict[str, Any]:
         """
-        Raw $SPXW chain JSON for today's expiration only.
+        Raw 0DTE chain JSON for today's expiration only.
 
-        Pinning from_date == to_date == today is what isolates the 0DTE
-        PM-settled contract set; combined with the $SPXW root this excludes
-        every monthly and every other weekly.
+        The chains endpoint only accepts the underlying ("$SPX"); "$SPXW" 400s.
+        Pinning from_date == to_date == today isolates today's expiration, and
+        _filter_contract_root keeps only the PM-settled SPXW contracts (the AM-
+        settled monthly shares the date on the 3rd Friday).
         """
         await self.throttle.gate()
         today = now_et().date()
@@ -142,6 +174,8 @@ class SchwabFeed:
         payload = resp.json()
         if payload.get("status") not in (None, "SUCCESS"):
             log.warning("Chain status=%s", payload.get("status"))
+        # Strip AM-settled monthlies that share today's date on the 3rd Friday.
+        _filter_contract_root(payload, CHAIN_CONTRACT_ROOT)
         return payload
 
     # ------------------------------------------------------------------ #

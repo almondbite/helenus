@@ -3,7 +3,7 @@
 import logging
 
 from helenus.bot import HelenusBot
-from helenus.config import DISCORD_TOKEN
+from helenus.config import ANTHROPIC_API_KEY, DISCORD_TOKEN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,6 +14,8 @@ logging.basicConfig(
 def main() -> None:
     if not DISCORD_TOKEN:
         raise SystemExit("HELENUS_DISCORD_TOKEN is not set (see .env.example)")
+    if not ANTHROPIC_API_KEY:
+        raise SystemExit("ANTHROPIC_API_KEY is not set (see .env.example)")
     bot = HelenusBot()
     bot.run(DISCORD_TOKEN, log_handler=None)
 
