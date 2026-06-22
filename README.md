@@ -56,9 +56,9 @@ which mechanically lifts spot. `flow.py` watches for this: **VIX falling** while
 fresh **OTM call flow outpaces OTM put flow**. It's weighted as one of Claude's
 most important inputs and is most potent as a *reversal* — a hard-falling tape
 where VIX rolls over and call flow turns is a high-conviction long, not a reason
-to stay bearish. `!flow` posts the volume ladder (ASCII histogram of per-strike
-volume above/below spot) plus the live vanna read; a vanna-driven alert attaches
-the ladder automatically. Tunable in `FlowConfig` (`vix_drop_pts`,
+to stay bearish. `!flow` posts the options-volume summary (call/put volume split
+ITM/OTM, above vs below spot) plus the live vanna read; a vanna-driven alert
+attaches it automatically. Tunable in `FlowConfig` (`vix_drop_pts`,
 `min_call_flow`, `call_dominance_ratio`).
 
 ## Accuracy feedback loop
@@ -99,7 +99,7 @@ intraday entry). In-flight alerts are tracked in memory, so a restart drops thei
 excursion tracking (the alert is still journaled).
 
 Discord commands: `!gex` (gamma board), `!scan` (tape internals), `!flow`
-(volume ladder + vanna), `!stats` (accuracy scorecard), `!review` (Claude
+(volume summary + vanna), `!stats` (accuracy scorecard), `!review` (Claude
 pattern review).
 
 ### Offline retrospective (`scripts/`)
@@ -157,7 +157,17 @@ can be verified by hand against the assertions.
   `Put GEX = -OI * Γ * 100 * spot`; net per strike; zero-gamma is the
   interpolated sign flip of cumulative net GEX.
 - **Volume proxy** — SPX prints no volume, so scan2's 20-period volume baseline
-  is built from SPY cumulative-volume deltas sampled by the macro loop.
+  is built from SPY cumulative-volume deltas. The delta is read at each bar
+  boundary (`_bar_volume`), so a bar's volume aligns to exactly that bar rather
+  than to the async macro tick.
+- **Spot sampling** — spot feeds the tape from both the chain poll and the 30s
+  macro `$SPX` quote, so intra-bar high/low don't starve when the chain throttle
+  widens on a dead tape. The `$SPX` quote's `closePrice` also seeds the
+  prior-session-close key level.
+- **Startup backfill** — on boot mid-session, `_backfill_state` warms `MarketState`
+  from today's 1-min history ($SPX OHLC + SPY volume), so session high/low, the
+  volume baseline, and trend are correct from the first live bar instead of
+  rebuilding from an empty tape.
 - **Throttling** — `AdaptiveThrottle` enforces a hard inter-call gap and widens
   the chain poll interval in premarket and when 5-minute realized range is dead.
 - **GEX math stays deterministic** — `gex.py` and the `MarketState` tape have no

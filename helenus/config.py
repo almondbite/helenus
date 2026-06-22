@@ -112,7 +112,6 @@ class FlowConfig:
     min_call_flow: float = 2000.0
     # OTM call flow must outpace OTM put flow by this multiple to be vanna-active.
     call_dominance_ratio: float = 1.5
-    ladder_strikes: int = 8             # strikes each side of spot in the visual
 
 
 @dataclass(frozen=True)

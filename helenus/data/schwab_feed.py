@@ -32,6 +32,7 @@ from helenus.config import (
     SCHWAB_API_KEY,
     SCHWAB_APP_SECRET,
     SCHWAB_TOKEN_PATH,
+    UNDERLYING_SYMBOL,
 )
 
 log = logging.getLogger("helenus.feed")
@@ -183,9 +184,31 @@ class SchwabFeed:
     # ------------------------------------------------------------------ #
 
     async def fetch_macro_quotes(self) -> dict[str, Any]:
-        """Single batched quote call: /CL, /GC, $VIX + SPY volume proxy."""
+        """Single batched quote call: /CL, /GC, $VIX, the SPY volume proxy, and
+        the $SPX index itself — a spot + prior-close sample that does NOT depend
+        on the chain-poll cadence (which the throttle widens when vol is dead)."""
         await self.throttle.gate()
-        symbols = list(MACRO_SYMBOLS) + [PROXY_SYMBOL]
+        symbols = list(MACRO_SYMBOLS) + [PROXY_SYMBOL, UNDERLYING_SYMBOL]
         resp = await self._client.get_quotes(symbols)
         resp.raise_for_status()
         return resp.json()
+
+    # ------------------------------------------------------------------ #
+    # Intraday price history (startup backfill)
+    # ------------------------------------------------------------------ #
+
+    async def fetch_intraday_candles(
+        self, symbol: str, start: dt.datetime, end: dt.datetime
+    ) -> list[dict[str, Any]]:
+        """1-minute candles for [start, end]. Used to warm MarketState on startup
+        so session high/low, the volume baseline, and trend are correct from the
+        first live bar instead of rebuilding from an empty tape after a restart."""
+        await self.throttle.gate()
+        resp = await self._client.get_price_history_every_minute(
+            symbol,
+            start_datetime=start,
+            end_datetime=end,
+            need_extended_hours_data=False,
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("candles", []) or []

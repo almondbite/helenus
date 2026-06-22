@@ -20,7 +20,7 @@ from collections import deque
 import discord
 from discord.ext import commands, tasks
 
-from helenus.config import CONFIG, DISCORD_CHANNEL_ID
+from helenus.config import CONFIG, DISCORD_CHANNEL_ID, PROXY_SYMBOL, UNDERLYING_SYMBOL
 from helenus.data.schwab_feed import ET, SchwabFeed, market_session, now_et
 from helenus.engine import flow as flow_engine
 from helenus.engine import gex as gex_engine
@@ -51,6 +51,26 @@ ALERT_COOLDOWN_SECS = 300  # same trigger+level can't re-fire inside 5 min
 CANDIDATE_COOLDOWN_SECS = 600
 
 
+def _candles_to_bars(price_candles: list[dict], volume_candles: list[dict]) -> list[Bar]:
+    """Merge $SPX 1-min OHLC with SPY 1-min volume (same minute timestamps) into
+    Bars for tape backfill. SPX prints no volume, so the SPY proxy supplies it —
+    matching how the live tape is built. Pure; testable without a feed."""
+    spy_vol = {c["datetime"]: c.get("volume", 0) for c in volume_candles}
+    bars: list[Bar] = []
+    for c in price_candles:
+        bars.append(
+            Bar(
+                ts=dt.datetime.fromtimestamp(c["datetime"] / 1000, tz=ET),
+                open=float(c["open"]),
+                high=float(c["high"]),
+                low=float(c["low"]),
+                close=float(c["close"]),
+                volume=float(spy_vol.get(c["datetime"], 0.0)),
+            )
+        )
+    return bars
+
+
 class HelenusBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -77,11 +97,14 @@ class HelenusBot(commands.Bot):
         # Macro tape
         self.vix_history: deque[float] = deque(maxlen=500)
         self.macro_quotes: dict = {}
+        # SPY cumulative volume read at each bar boundary (not async-accumulated),
+        # so each bar's volume is the delta over exactly that bar — see bar_worker.
         self._last_spy_cum_volume: float | None = None
-        self._interval_volume: float = 0.0
-        # Intra-bar extremes, folded from chain-poll spot samples between bar
-        # closes. Without a streaming feed this is how Bar.high/low get real
-        # range instead of collapsing to the close — see _observe_spot.
+        # Freshest spot, fed by both the chain poll and the 30s macro $SPX quote,
+        # so the tape doesn't starve when the chain throttle widens.
+        self._last_spot: float | None = None
+        # Intra-bar extremes, folded from spot samples between bar closes. Without
+        # a streaming feed this is how Bar.high/low get real range — see _observe_spot.
         self._bar_high: float = float("-inf")
         self._bar_low: float = float("inf")
 
@@ -95,6 +118,10 @@ class HelenusBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.feed.connect()
+        # Warm the tape from today's 1-min history before any bar closes, so a
+        # mid-session restart doesn't start blind (wrong session H/L, cold
+        # baselines). Best-effort — never block startup on it.
+        await self._backfill_state()
         self.add_command(cmd_gex)
         self.add_command(cmd_scan)
         self.add_command(cmd_flow)
@@ -123,6 +150,32 @@ class HelenusBot(commands.Bot):
 
     def alert_channel(self) -> discord.abc.Messageable | None:
         return self.get_channel(DISCORD_CHANNEL_ID)
+
+    async def _post(self, embed: discord.Embed) -> bool:
+        """Send one embed to the alert channel; log (never raise) on failure.
+
+        Returns True if it went out. A delivery problem — channel that won't
+        resolve, missing perms, transient network/Discord error — is logged
+        loudly and swallowed, so it can neither (a) pass silently as it did
+        before (alerts journaled but never posted, with no trace) nor (b) raise
+        out of a tasks.loop and kill the worker.
+        """
+        channel = self.alert_channel()
+        if channel is None:
+            log.warning(
+                "Alert NOT delivered: channel %s did not resolve — bot isn't in "
+                "that server, or HELENUS_CHANNEL_ID is wrong/stale. Config is read "
+                "once at startup, so restart after editing .env. "
+                "(Run scripts/diagnose_channel.py to inspect.)",
+                DISCORD_CHANNEL_ID,
+            )
+            return False
+        try:
+            await channel.send(embed=embed)
+            return True
+        except Exception:
+            log.exception("Alert send to channel %s failed", DISCORD_CHANNEL_ID)
+            return False
 
     # ------------------------------------------------------------------ #
     # Workers
@@ -158,9 +211,10 @@ class HelenusBot(commands.Bot):
         """Closes a bar each interval and evaluates Triggers 1 & 2."""
         if market_session() != "regular" or self.profile is None:
             return
-        spot = self.profile.spot
+        # Freshest spot (macro $SPX quote or chain poll), not just the chain mark.
+        spot = self._last_spot if (self._last_spot and self._last_spot > 0) else self.profile.spot
         if spot <= 0:
-            return  # broken chain payload — don't poison the tape / extremes
+            return  # no valid spot yet — don't poison the tape / extremes
         self._observe_spot(spot)  # ensure the closing print is in the range
         bar = Bar(
             ts=now_et(),
@@ -168,9 +222,8 @@ class HelenusBot(commands.Bot):
             high=self._bar_high,
             low=self._bar_low,
             close=spot,
-            volume=self._interval_volume,
+            volume=self._bar_volume(),
         )
-        self._interval_volume = 0.0
         # Reset extremes for the next interval (after the close was folded in).
         self._bar_high = float("-inf")
         self._bar_low = float("inf")
@@ -216,11 +269,18 @@ class HelenusBot(commands.Bot):
         if vix:
             self.vix_history.append(float(vix))
 
-        spy_vol = (quotes.get("SPY", {}).get("quote") or {}).get("totalVolume")
-        if spy_vol is not None:
-            if self._last_spy_cum_volume is not None:
-                self._interval_volume += max(0.0, spy_vol - self._last_spy_cum_volume)
-            self._last_spy_cum_volume = float(spy_vol)
+        # $SPX index quote: a spot sample independent of the chain throttle, plus
+        # the prior-session close (set once) so "Prior Close" becomes a real level.
+        spx_q = quotes.get(UNDERLYING_SYMBOL, {}).get("quote") or {}
+        spx_last = spx_q.get("lastPrice")
+        if spx_last:
+            self._observe_spot(float(spx_last))
+        if self.state.prior_close is None:
+            spx_close = spx_q.get("closePrice")
+            if spx_close:
+                self.state.prior_close = float(spx_close)
+        # SPY cumulative volume is read at the bar boundary (see _bar_volume),
+        # not accumulated here, so each bar's volume aligns to exactly that bar.
 
     @macro_worker.before_loop
     async def _macro_ready(self) -> None:
@@ -237,9 +297,9 @@ class HelenusBot(commands.Bot):
         except Exception:
             log.exception("premarket routine failed")
             return
-        channel = self.alert_channel()
-        if channel:
-            await channel.send(embed=embeds.premarket_embed(sig, macro_lines))
+        # Mark sent only on a confirmed post, so a delivery failure doesn't
+        # silently burn today's briefing.
+        if await self._post(embeds.premarket_embed(sig, macro_lines)):
             self._premarket_sent_on = today
 
     @premarket_worker.before_loop
@@ -258,11 +318,7 @@ class HelenusBot(commands.Bot):
         review = await self._run_review()
         if review is None:
             return
-        channel = self.alert_channel()
-        if channel:
-            await channel.send(
-                embed=embeds.review_embed(review, self.journal.stats())
-            )
+        await self._post(embeds.review_embed(review, self.journal.stats()))
 
     @review_worker.before_loop
     async def _review_ready(self) -> None:
@@ -273,11 +329,55 @@ class HelenusBot(commands.Bot):
     # ------------------------------------------------------------------ #
 
     def _observe_spot(self, spot: float) -> None:
-        """Fold a fresh spot sample into the forming bar's high/low extremes."""
+        """Record a fresh spot sample. Always updates the freshest-spot pointer;
+        only folds into the forming bar's high/low during the regular session, so
+        premarket prints don't bleed into the first regular bar's range."""
         if spot <= 0:
+            return
+        self._last_spot = spot
+        if market_session() != "regular":
             return
         self._bar_high = max(self._bar_high, spot)
         self._bar_low = min(self._bar_low, spot)
+
+    def _bar_volume(self) -> float:
+        """Per-bar SPY-proxy volume: the cumulative-volume delta since the last
+        bar close, read at the boundary. Aligns volume to the bar instead of the
+        async ±30s accumulation the macro loop used to do."""
+        spy_cum = (self.macro_quotes.get(PROXY_SYMBOL, {}).get("quote") or {}).get("totalVolume")
+        if spy_cum is None:
+            return 0.0
+        spy_cum = float(spy_cum)
+        prev = self._last_spy_cum_volume
+        self._last_spy_cum_volume = spy_cum
+        # First reading (or a daily cumulative reset) has no valid delta.
+        return max(0.0, spy_cum - prev) if prev is not None else 0.0
+
+    async def _backfill_state(self) -> None:
+        """Seed MarketState from today's 1-min history: $SPX OHLC for price (and
+        session H/L + trend), SPY per-minute volume for the baseline. Best-effort
+        and idempotent-on-restart; never raises into startup."""
+        if market_session() == "closed":
+            return
+        try:
+            today = now_et().date()
+            start = dt.datetime.combine(today, dt.time(9, 30), tzinfo=ET)
+            end = now_et()
+            if end <= start:
+                return  # premarket — nothing intraday to backfill yet
+            spx = await self.feed.fetch_intraday_candles(UNDERLYING_SYMBOL, start, end)
+            spy = await self.feed.fetch_intraday_candles(PROXY_SYMBOL, start, end)
+            bars = _candles_to_bars(spx, spy)
+            for b in bars:
+                self.state.push_bar(b)
+            if bars:
+                self._last_spot = bars[-1].close
+                log.info(
+                    "Backfilled %d bars (session H/L %.2f / %.2f)",
+                    len(bars), self.state.session_high, self.state.session_low,
+                )
+        except Exception:
+            log.exception("state backfill failed — starting with a cold tape")
 
     def _candidate_throttled(self, candidate) -> bool:
         """True if this trigger+level already spent a Claude call recently.
@@ -397,18 +497,13 @@ class HelenusBot(commands.Bot):
         self._alert_log[key] = now
         # Open MFE/MAE tracking before posting — grade it regardless of Discord.
         self._record_alert(sig)
-        channel = self.alert_channel()
-        if not channel:
-            return
-        await channel.send(
-            embed=embeds.signal_embed(
-                sig, self.profile, self.vol_profile, self.vanna_reading
-            )
+        posted = await self._post(
+            embeds.signal_embed(sig, self.profile, self.vol_profile, self.vanna_reading)
         )
-        # A vanna-driven call is about the volume distribution — show the ladder.
-        if sig.trigger is TriggerType.VANNA_RALLY and self.vol_profile is not None:
-            await channel.send(
-                embed=embeds.volume_profile_embed(self.vol_profile, self.vanna_reading)
+        # A vanna-driven call is about the volume distribution — show the breakdown.
+        if posted and sig.trigger is TriggerType.VANNA_RALLY and self.vol_profile is not None:
+            await self._post(
+                embeds.volume_profile_embed(self.vol_profile, self.vanna_reading)
             )
 
 
@@ -447,7 +542,7 @@ async def cmd_scan(ctx: commands.Context) -> None:
 
 @commands.command(name="flow")
 async def cmd_flow(ctx: commands.Context) -> None:
-    """!flow — post the 0DTE options-volume ladder + vanna read."""
+    """!flow — post the 0DTE options-volume summary + vanna read."""
     bot: HelenusBot = ctx.bot  # type: ignore[assignment]
     if bot.vol_profile is None:
         await ctx.send("No 0DTE volume snapshot yet — engine warming up.")

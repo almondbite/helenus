@@ -12,9 +12,7 @@ from __future__ import annotations
 import datetime as dt
 
 import discord
-import pandas as pd
 
-from helenus.config import CONFIG
 from helenus.data.schwab_feed import now_et
 from helenus.engine.flow import VannaReading, VolumeProfile
 from helenus.engine.gex import GexProfile
@@ -36,6 +34,40 @@ def _footer(ts: dt.datetime | None = None) -> str:
 
 def _color(direction: Direction) -> discord.Color:
     return COLOR_BULL if direction is Direction.BULLISH else COLOR_BEAR
+
+
+# Discord's hard limits on embed parts. A verdict that exceeds them gets the
+# whole send rejected with 400 Invalid Form Body, so every free-text value that
+# Claude can fill is clipped to fit. (Field 1024 / description 4096 / name 256.)
+_FIELD_VALUE_MAX = 1024
+_DESC_MAX = 4096
+_FIELD_NAME_MAX = 256
+_TOTAL_MAX = 6000
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _field(embed: discord.Embed, name: str, value: str, inline: bool = False) -> None:
+    """add_field that clips name/value to Discord's limits (and never sends an
+    empty value, which also 400s)."""
+    embed.add_field(
+        name=_clip(name, _FIELD_NAME_MAX),
+        value=_clip(value, _FIELD_VALUE_MAX) or "—",
+        inline=inline,
+    )
+
+
+def _fit(embed: discord.Embed) -> discord.Embed:
+    """Final safety net: even with every part individually within its limit, the
+    whole embed must stay under 6000 chars. If it's over (many long fields), trim
+    the description to make room rather than let Discord 400 the send."""
+    over = len(embed) - _TOTAL_MAX
+    if over > 0 and embed.description:
+        embed.description = _clip(embed.description, max(0, len(embed.description) - over))
+    return embed
 
 
 def _fmt_gex(value: float) -> str:
@@ -78,104 +110,71 @@ def signal_embed(
     arrow = "▲" if sig.direction is Direction.BULLISH else "▼"
     embed = discord.Embed(
         title=f"{arrow} {sig.trigger.value} — {sig.trend_label}",
+        # The thesis + risk flags live in the description (4096) rather than a
+        # field (1024) — Claude's read routinely runs longer than a field allows.
+        description=_clip("\n".join(f"• {n}" for n in sig.notes), _DESC_MAX) or None,
         color=_color(sig.direction),
         timestamp=now_et(),
     )
-    embed.add_field(name="Spot", value=f"{sig.spot:.2f}", inline=True)
+    _field(embed, "Spot", f"{sig.spot:.2f}", inline=True)
     if sig.level is not None:
-        embed.add_field(
-            name="Level", value=f"{sig.level.label} ({sig.level.price:.2f})", inline=True
-        )
+        _field(embed, "Level", f"{sig.level.label} ({sig.level.price:.2f})", inline=True)
     if sig.volume_ratio == sig.volume_ratio:  # not NaN
-        embed.add_field(name="Volume", value=f"{sig.volume_ratio:.1f}x 20-MA", inline=True)
-    embed.add_field(name="Confidence", value=f"{sig.confidence:.0f}%", inline=True)
+        _field(embed, "Volume", f"{sig.volume_ratio:.1f}x 20-MA", inline=True)
+    _field(embed, "Confidence", f"{sig.confidence:.0f}%", inline=True)
 
     if gex is not None:
         zg = f"{gex.zero_gamma:.0f}" if gex.zero_gamma is not None else "n/a"
-        embed.add_field(
-            name="Gamma Context",
-            value=f"Regime: `{gex.regime}` | Zero-Γ: `{zg}` | Net: `{_fmt_gex(gex.total_net_gex)}`",
-            inline=False,
+        _field(
+            embed,
+            "Gamma Context",
+            f"Regime: `{gex.regime}` | Zero-Γ: `{zg}` | Net: `{_fmt_gex(gex.total_net_gex)}`",
         )
     if vol_profile is not None:
-        embed.add_field(
-            name="Options Flow", value=_flow_line(vol_profile, vanna), inline=False
-        )
-    if sig.notes:
-        embed.add_field(name="Read", value="\n".join(f"• {n}" for n in sig.notes), inline=False)
+        _field(embed, "Options Flow", _flow_line(vol_profile, vanna))
 
     embed.set_footer(text=_footer())
-    return embed
+    return _fit(embed)
 
 
 def volume_profile_embed(
     vp: VolumeProfile, vanna: VannaReading | None = None
 ) -> discord.Embed:
     """
-    0DTE options-volume ladder: an ASCII histogram of per-strike volume around
-    spot, so you can *see* where the distribution sits above vs below price.
-    Greys out unless a vanna setup is live (then green).
+    0DTE options-volume summary: where call/put volume sits relative to spot
+    (ITM/OTM split, above vs below). Greys out unless a vanna setup is live.
     """
     active = vanna is not None and vanna.active
     embed = discord.Embed(
-        title="$SPXW 0DTE — Options Volume Ladder",
+        title="$SPXW 0DTE — Options Volume",
         color=COLOR_BULL if active else COLOR_INFO,
         timestamp=now_et(),
     )
-
-    bs = vp.by_strike
-    n = CONFIG.flow.ladder_strikes
-    if not bs.empty:
-        above = bs[bs.index > vp.spot].sort_index().head(n).sort_index(ascending=False)
-        below = bs[bs.index < vp.spot].sort_index(ascending=False).head(n)
-        window = pd.concat([above, below])
-        max_vol = float(window["total"].max()) or 1.0
-        width = 12
-
-        def _bar(total: float) -> str:
-            fill = int(round(total / max_vol * width))
-            return "█" * fill + "░" * (width - fill)
-
-        def _row(strike: float, row) -> str:
-            total = float(row.total)
-            cv, pv = float(row.call_volume), float(row.put_volume)
-            side = "C" if cv >= pv else "P"
-            return f"{strike:>7.0f} {side} {_bar(total)} {_fmt_vol(total):>6}"
-
-        lines = [_row(s, r) for s, r in above.iterrows()]
-        lines.append(f"{'─' * 9} spot {vp.spot:.2f} {'─' * 9}")
-        lines += [_row(s, r) for s, r in below.iterrows()]
-        embed.description = "```\n" + "\n".join(lines) + "\n```"
-    else:
+    if vp.by_strike.empty:
         embed.description = "_No 0DTE volume yet._"
 
-    embed.add_field(
-        name="Above spot", value=f"`{_fmt_vol(vp.above_spot_vol)}`", inline=True
-    )
-    embed.add_field(
-        name="Below spot", value=f"`{_fmt_vol(vp.below_spot_vol)}`", inline=True
-    )
-    embed.add_field(
-        name="Call/Put", value=f"`{vp.call_put_ratio:.2f}x`", inline=True
-    )
-    embed.add_field(
-        name="OTM calls / ITM calls",
-        value=f"`{_fmt_vol(vp.otm_call_vol)}` / `{_fmt_vol(vp.itm_call_vol)}`",
+    _field(embed, "Spot", f"{vp.spot:.2f}", inline=True)
+    _field(embed, "Above spot", f"`{_fmt_vol(vp.above_spot_vol)}`", inline=True)
+    _field(embed, "Below spot", f"`{_fmt_vol(vp.below_spot_vol)}`", inline=True)
+    _field(embed, "Call/Put", f"`{vp.call_put_ratio:.2f}x`", inline=True)
+    _field(
+        embed,
+        "OTM calls / ITM calls",
+        f"`{_fmt_vol(vp.otm_call_vol)}` / `{_fmt_vol(vp.itm_call_vol)}`",
         inline=True,
     )
-    embed.add_field(
-        name="OTM puts / ITM puts",
-        value=f"`{_fmt_vol(vp.otm_put_vol)}` / `{_fmt_vol(vp.itm_put_vol)}`",
+    _field(
+        embed,
+        "OTM puts / ITM puts",
+        f"`{_fmt_vol(vp.otm_put_vol)}` / `{_fmt_vol(vp.itm_put_vol)}`",
         inline=True,
     )
-    embed.add_field(
-        name="OTM C/P", value=f"`{vp.otm_call_put_ratio:.2f}x`", inline=True
-    )
+    _field(embed, "OTM C/P", f"`{vp.otm_call_put_ratio:.2f}x`", inline=True)
     if vanna is not None:
-        embed.add_field(name="Vanna", value=f"`{vanna.label}` — {vanna.note}", inline=False)
+        _field(embed, "Vanna", f"`{vanna.label}` — {vanna.note}")
 
     embed.set_footer(text=_footer())
-    return embed
+    return _fit(embed)
 
 
 def gex_snapshot_embed(gex: GexProfile) -> discord.Embed:
@@ -186,24 +185,26 @@ def gex_snapshot_embed(gex: GexProfile) -> discord.Embed:
         timestamp=now_et(),
     )
     zg = f"{gex.zero_gamma:.0f}" if gex.zero_gamma is not None else "n/a"
-    embed.add_field(name="Spot", value=f"{gex.spot:.2f}", inline=True)
-    embed.add_field(name="Zero Gamma", value=zg, inline=True)
-    embed.add_field(name="Net GEX", value=_fmt_gex(gex.total_net_gex), inline=True)
+    _field(embed, "Spot", f"{gex.spot:.2f}", inline=True)
+    _field(embed, "Zero Gamma", zg, inline=True)
+    _field(embed, "Net GEX", _fmt_gex(gex.total_net_gex), inline=True)
 
     if gex.call_walls:
-        embed.add_field(
-            name="Call Walls (resistance)",
-            value="\n".join(f"`{k:.0f}` — {_fmt_gex(v)}" for k, v in gex.call_walls),
+        _field(
+            embed,
+            "Call Walls (resistance)",
+            "\n".join(f"`{k:.0f}` — {_fmt_gex(v)}" for k, v in gex.call_walls),
             inline=True,
         )
     if gex.put_walls:
-        embed.add_field(
-            name="Put Walls (support)",
-            value="\n".join(f"`{k:.0f}` — {_fmt_gex(v)}" for k, v in gex.put_walls),
+        _field(
+            embed,
+            "Put Walls (support)",
+            "\n".join(f"`{k:.0f}` — {_fmt_gex(v)}" for k, v in gex.put_walls),
             inline=True,
         )
     embed.set_footer(text=_footer())
-    return embed
+    return _fit(embed)
 
 
 def review_embed(review: dict, stats: dict) -> discord.Embed:
@@ -211,13 +212,14 @@ def review_embed(review: dict, stats: dict) -> discord.Embed:
     acc = stats.get("accuracy_pct", 0.0)
     embed = discord.Embed(
         title="🔁 Accuracy Review — scan2 feedback loop",
-        description=review.get("summary", ""),
+        description=_clip(review.get("summary", ""), _DESC_MAX),
         color=COLOR_BULL if acc >= 50 else COLOR_BEAR if acc < 35 else COLOR_INFO,
         timestamp=now_et(),
     )
-    embed.add_field(
-        name="Scorecard",
-        value=(
+    _field(
+        embed,
+        "Scorecard",
+        (
             f"`{stats.get('count', 0)}` graded | "
             f"**{acc:.0f}%** accurate "
             f"(`{stats.get('accurate', 0)}`✓ / `{stats.get('mixed', 0)}`~ / "
@@ -226,37 +228,30 @@ def review_embed(review: dict, stats: dict) -> discord.Embed:
             f"MAE `{stats.get('avg_mae_pts', 0)}` pts | "
             f"ratio `{stats.get('avg_ratio', 0)}`"
         ),
-        inline=False,
     )
 
     def _bullets(items: list[str], limit: int = 5) -> str:
         return "\n".join(f"• {x}" for x in items[:limit]) or "—"
 
     if review.get("accurate_patterns"):
-        embed.add_field(
-            name="What works", value=_bullets(review["accurate_patterns"]), inline=False
-        )
+        _field(embed, "What works", _bullets(review["accurate_patterns"]))
     if review.get("inaccurate_patterns"):
-        embed.add_field(
-            name="What misses", value=_bullets(review["inaccurate_patterns"]), inline=False
-        )
+        _field(embed, "What misses", _bullets(review["inaccurate_patterns"]))
     if review.get("suggestions"):
-        embed.add_field(
-            name="Tune", value=_bullets(review["suggestions"]), inline=False
-        )
+        _field(embed, "Tune", _bullets(review["suggestions"]))
     embed.set_footer(text=_footer())
-    return embed
+    return _fit(embed)
 
 
 def premarket_embed(sig: Signal, macro_lines: list[str] | None = None) -> discord.Embed:
     embed = discord.Embed(
         title=f"☀ Pre-Market Briefing — {sig.trend_label}",
+        description=_clip("\n".join(f"• {n}" for n in sig.notes), _DESC_MAX) or None,
         color=_color(sig.direction),
         timestamp=now_et(),
     )
-    embed.add_field(name="Confidence", value=f"{sig.confidence:.0f}%", inline=True)
-    embed.add_field(name="Overnight Read", value="\n".join(f"• {n}" for n in sig.notes), inline=False)
+    _field(embed, "Confidence", f"{sig.confidence:.0f}%", inline=True)
     if macro_lines:
-        embed.add_field(name="Macro Board", value="\n".join(macro_lines), inline=False)
+        _field(embed, "Macro Board", "\n".join(macro_lines))
     embed.set_footer(text=_footer())
-    return embed
+    return _fit(embed)
