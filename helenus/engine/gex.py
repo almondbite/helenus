@@ -149,10 +149,30 @@ class GexProfile:
 
     @property
     def regime(self) -> str:
-        """Above flip in positive gamma -> mean reversion; below -> expansion."""
+        """Dealer-gamma regime: POSITIVE_GAMMA dampens moves (mean-reverting),
+        NEGATIVE_GAMMA amplifies them (trend/expansion).
+
+        Two reads can disagree. The *structural* read is spot vs the zero-gamma
+        flip; the *aggregate* read is the sign of total net GEX. Because
+        `_zero_gamma_flip` returns the lowest cumulative-zero crossing, a chain
+        whose total net GEX is deeply negative can still leave that first flip
+        below spot — so the structural read falsely reports POSITIVE_GAMMA while
+        dealers are actually net short gamma (amplification). That contradiction
+        was the engine's most persistent mislabel.
+
+        When the two reads disagree the tape is genuinely conflicted: trust the
+        net-GEX sign (the dampening/amplification that actually expresses itself)
+        and flag it as such, rather than asserting a clean regime the structure
+        doesn't support.
+        """
         if self.zero_gamma is None:
             return "UNKNOWN"
-        return "POSITIVE_GAMMA" if self.spot >= self.zero_gamma else "NEGATIVE_GAMMA"
+        structural_positive = self.spot >= self.zero_gamma
+        net_positive = self.total_net_gex >= 0
+        if structural_positive == net_positive:
+            return "POSITIVE_GAMMA" if net_positive else "NEGATIVE_GAMMA"
+        # Structure and net-GEX sign conflict — report the net-GEX truth, flagged.
+        return "POSITIVE_GAMMA_CONFLICTED" if net_positive else "NEGATIVE_GAMMA_CONFLICTED"
 
     def nearest_cluster_distance(self, price: float) -> float:
         """Distance in points from price to the nearest major GEX wall."""

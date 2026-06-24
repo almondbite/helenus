@@ -13,7 +13,13 @@ reads. You aim. Not financial advice.*
 helenus/
   config.py             secrets + engine tuning (dataclasses)
   data/schwab_feed.py   schwab-py AsyncClient, SPXW 0DTE fetch, AdaptiveThrottle
+  data/schwab_stream.py StreamClient websocket: option premium / /ES / SPY (live)
   engine/gex.py         chain JSON -> DataFrame -> Net GEX, walls, zero-gamma
+  engine/charm.py       OTM-wing delta-decay (charm) -> support/overhead drift
+  engine/scalp.py       1m 5/9 EMA-ignition scalp: gated cross + premium target
+  engine/displacement.py institutional thrust: candle + FVG + MSS (+ sweep)
+  engine/orb.py         opening-range breakout: locked range + volume/VWAP gates
+  engine/moc.py         market-on-close: premium-behavior reversal + capitulation
   engine/flow.py        0DTE call/put volume (ITM/OTM split) + vanna-rally tracker
   engine/scan2.py       pure rolling tape + key levels + candidate GATE (no verdict)
   engine/analyst.py     Claude reads the structured state -> Signal (the judgment)
@@ -33,9 +39,14 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    split ITM/OTM around spot) and runs the **vanna-rally tracker** (see below).
 4. `engine/scan2.py` keeps the rolling bar tape + key-level grid and runs
    `detect_candidate` — a cheap gate that only decides whether a bar is *worth a
-   Claude call*. It watches, highest-information first, for: a **flow setup**
-   (bullish vanna rally, or its bearish mirror **put-flow pressure**), a
-   **regime flip** (spot crossing the zero-gamma pivot), a **liquidity sweep**, a
+   Claude call*. It watches, highest-information first, leading with the **main
+   edges**: an **EMA ignition** (a gated 1m 5/9 cross / 5-EMA reclaim — a primary
+   momentum edge, see below), a **regime flip** (spot crossing the zero-gamma
+   pivot), a **displacement** (institutional thrust: candle + FVG + MSS), and the
+   power-hour **MOC plays** (see below); then, demoted beneath them, a **flow
+   confluence** — a bullish vanna rally or its bearish mirror **put-flow pressure**
+   (corroboration, no longer the headline trigger); then an **ORB breakout** (a
+   confirmed close beyond the locked opening range), a **liquidity sweep**, a
    **level rejection** (probe-and-reverse at the *edge* of the session range —
    the range-day reversal), a **range-expansion** thrust between levels (the
    trend-day momentum signal), or a **level cross on volume**. The key-level grid
@@ -45,25 +56,210 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    session extreme (`edge_proximity_pts`), so an interior wall price *pins*
    doesn't spam — and the bot further debounces candidates per
    trigger+level (`CANDIDATE_COOLDOWN_SECS`).
+   The grid also carries the **charm support/resistance walls** (see below).
+4b. `engine/charm.py` reads the same chain into a `CharmProfile` — the OTM-wing
+   delta-decay structure (supportive vs overhead drift), keyed off live
+   minutes-to-expiry so it ramps into the afternoon.
 5. `engine/analyst.py` hands Claude the structured snapshot (options flow + vanna,
-   GEX regime, walls, tape, levels, VWAP, session phase / time-of-day, macro) and
-   gets back a typed verdict via structured outputs: `has_signal`, `direction`,
+   GEX regime, walls, charm bias, tape, levels, VWAP, session phase / time-of-day,
+   macro) and gets back a typed verdict via structured outputs: `has_signal`, `direction`,
    `confidence`, `thesis`, `risk_flags`. Claude may answer `has_signal=false` and
    stay quiet.
 6. `output/embeds.py` renders the `Signal` to a color-coded Discord embed.
 
-## The vanna rally (the edge)
+## The vanna rally (a flow confluence)
 
 When VIX falls, implied vol drops, so calls get cheaper — buyers pile into OTM
 calls. Dealers short those calls must buy the underlying to stay hedged (vanna),
 which mechanically lifts spot. `flow.py` watches for this: **VIX falling** while
-fresh **OTM call flow outpaces OTM put flow**. It's weighted as one of Claude's
-most important inputs and is most potent as a *reversal* — a hard-falling tape
-where VIX rolls over and call flow turns is a high-conviction long, not a reason
-to stay bearish. `!flow` posts the options-volume summary (call/put volume split
+fresh **OTM call flow outpaces OTM put flow**. It used to be Helenus's headline
+edge; it's now read as a **confluence** that corroborates a setup — the main edges
+(the EMA-ignition scalp, the regime flip, displacement, the MOC plays) lead, and
+flow confirms or fades them. It's still most potent as a *reversal* tell — a
+hard-falling tape where VIX rolls over and call flow turns is strong confirmation
+for a long when a primary setup lines up — but it no longer carries an alert on
+its own. `!flow` posts the options-volume summary (call/put volume split
 ITM/OTM, above vs below spot) plus the live vanna read; a vanna-driven alert
 attaches it automatically. Tunable in `FlowConfig` (`vix_drop_pts`,
 `min_call_flow`, `call_dominance_ratio`).
+
+## Charm — the afternoon melt-up (delta decay)
+
+Charm is ∂Δ/∂t: how an option's delta bleeds away as time passes. For 0DTE it's
+a dominant structural force with a specific dealer-flow story. Customers are net
+long the OTM wings (lottery puts/calls); dealers are short them and hedge in the
+underlying. As the wings decay, that hedge becomes too large and gets unwound —
+mechanical flow with no conviction behind it:
+
+- **OTM puts → positive charm → SUPPORTIVE.** Dealers were short futures to hedge
+  the puts; as put delta decays they buy futures back, putting a floor under
+  price. This is the engine of the low-volume **afternoon melt-up** — when the
+  morning sell-off everyone hedged for never came, that hedge unwinds upward.
+- **OTM calls → negative charm → OVERHEAD.** Dealers were long futures to hedge
+  the calls; as call delta decays they sell, capping rallies and bleeding price
+  lower into the close.
+
+Two amplifiers: **open interest** (more OI in a wing = more delta to decay = more
+futures to unwind — charm scales with OI) and **time** (charm ∝ 1/T, so it's
+small in the morning and accelerates hard into the afternoon — `intensity` reads
+LOW → BUILDING → HIGH, HIGH being the ≤2h melt-up window). `charm.py` computes it
+analytically (Black-Scholes ∂Δ/∂t from each contract's own IV and live
+minutes-to-expiry; Schwab doesn't emit charm the way it does gamma). `net_charm`
+follows GEX's sign discipline: positive = supportive (bull drift), negative =
+overhead (bear drift). The charm support/resistance walls join the key-level grid
+(`Charm Support`/`Charm Resist`), and the bias feeds Claude as a *drift* input —
+it raises conviction on with-charm setups (a bounce off charm support in a
+supportive afternoon) and lowers it on against-charm ones. `!charm` posts the
+structure board. Tunable in `CharmConfig`.
+
+## EMA Ignition — the 1m 5/9 contract scalp (a primary momentum edge)
+
+**One of Helenus's main edges.** A visual 0DTE scalp replicated mechanically: go
+long when the option contract's 1-minute **5 EMA crosses above the 9 EMA** (or
+reclaims the 5 EMA off a local bottom), targeting a structural level
+**pre-translated into option premium**; the **200 EMA** is a dynamic
+floor/ceiling. The literal edge is that charting the contract front-runs the index
+and visualizes "gamma ignition." The weakness is that the raw 5/9 cross is
+**noisy** — it whipsaws in chop, high-positive-GEX pins, and vanna (vol-crush)
+tape. So the cross is the *trigger, not the edge — the edge is the filtering*, and
+`engine/scalp.py` wraps it in a gated stack that is exactly what makes this a
+primary setup rather than a noisy scalp:
+
+- **Regime (Gate 0).** Momentum only in negative/transition GEX (green); stand
+  down in high-positive GEX (red — dealers fade every push).
+- **Vanna headwind (Gate 1).** Falling IV bleeds vega out of a long option's
+  premium, so a strongly falling VIX is a premium headwind (the logged "calls
+  drag, puts carry" asymmetry) — distinct from the vanna *rally* (a spot signal).
+- **SPX confirmation (Gate 2).** SPX itself must confirm — price on the trade-side
+  of session VWAP (falls back to the structural trend before VWAP is warm).
+- **De-noising (Gate 3).** A **chop counter** (N+ 5/9 crosses in a tight window =
+  chop), a **room-to-target** floor (≥8pt, matching the analyst's magnet rule), an
+  acceptable **contract spread**, and a **dual-bleed** avoidance flag (both ATM
+  wings bleeding = a GEX-pinned chop signature).
+
+EMAs run on the clean continuous SPX **index** tape (`MarketState`); the selected
+contract's **premium** is tracked separately for two boosters — the
+**gamma-ignition front-run** (the contract's own 5/9 already crossed in-direction)
+and **premium divergence** (the contract refuses to confirm the index's extreme,
+vega being bid into a reversal). When a fresh cross clears the *entire* stack the
+gate emits an `EMA Ignition` candidate carrying the **delta-targeted OTM strike**
+and the **level→premium target** (first-order delta translation plus a gamma
+convexity term); Claude still renders the verdict. `!scalp` posts the board.
+Tunable in `ScalpConfig`. (Phase 2, deferred: the contract's own take-profit
+spike, vega-extraction, theta-trendline, and volume-absorption *exit* signals,
+which need per-contract volume/wick candles off a streaming feed.)
+
+## Displacement — the institutional thrust
+
+A displacement is the footprint of one-sided "smart money" flow: a sudden,
+aggressive, full-bodied candle on heavy volume. A big candle alone isn't a
+signal, so `engine/displacement.py` requires three structural pillars before it
+fires:
+
+- **Displacement candle** — body ≥ an ATR multiple, mostly body (small wicks),
+  on volume well above the 20-bar baseline.
+- **Market structure shift (MSS)** — the thrust *closes past a recent swing*
+  high/low, proof the trend actually turned rather than just wicking.
+- **Fair value gap (FVG)** — the move is so fast the other side can't keep up,
+  leaving a 3-candle imbalance (candle 1 and candle 3 wicks don't overlap). That
+  gap is a high-quality **retrace-entry zone**, not a chase.
+
+Per the design, the **candle + FVG + MSS are the hard gate** (all crisply
+computable from the tape); the fourth pillar, the **liquidity sweep** (the move
+began by running stops beyond a prior swing then reversing — the trap), is
+detected and surfaced as a strong conviction *booster*, with a `require_sweep`
+flag to harden it once tuned. The reading is pure/stateless. Claude weighs the
+FVG retrace zone and the sweep, and flags chase-risk when price has already
+extended far past the gap toward an opposing magnet. `!disp` posts the board.
+Tunable in `DisplacementConfig`.
+
+## ORB — the opening range breakout
+
+The first minutes after the 09:30 open carve out a range as liquidity floods in;
+whichever way price *closes* out of it tends to set the session's direction.
+`engine/orb.py` locks the high/low of the opening window (default 15 min), then
+treats a 1-minute bar **closing** beyond the locked range as the breakout (long
+above the high, short below the low — a close, not a wick, the standard fakeout
+guard). Two **hard filters** gate the fakeout problem: **volume confirmation**
+(the breakout bar clears a baseline volume multiple — institutional
+participation) and **VWAP alignment** (a long is skipped while price is below the
+day's VWAP, a short while above). Targets are **R-multiples** of the range height
+(1R/2R) with the opposite edge as the stop. It's session-stateful (the locked
+range outlives the bars that formed it), fires at most once per side per day, and
+`warm`s from the backfill so a restart re-establishes the range without
+re-alerting a past break. `!orb` posts the board. Tunable in `ORBConfig`.
+
+## MOC — the power-hour close play
+
+The 4:00 ET closing auction forces enormous passive flow (index funds, ETF
+rebalances, fund creations/redemptions) to print at the close, so the tape gets
+magnetized into it and tends to **reverse then drift** in recurring patterns.
+Those patterns *drift* over time, so `engine/moc.py` surfaces them as priors and
+**logs them** — every MOC alert's context (heuristic color, basing side, volume
+surge, GEX state, capitulation stats) is journaled so the review → `lessons.md`
+loop learns which still pay. No imbalance feed is used (it isn't in the Schwab
+API and isn't needed); the play is read from mechanical proxies, deliberately
+using **few variables**:
+
+- **The MOC reversal (the priority play).** Between 3:50–3:55 price likes to
+  reverse, read with a *simplified* version of the 0DTE premium-behavior strategy
+  — **only options premium and volume**. When one side's (call/put) premium
+  **bases** (prints a higher-low off a decline) while that side's fresh interval
+  **volume surges** vs the opposing side, that side wins the reversal: a basing
+  put side with surging put volume is a bearish reversal into the close (the
+  textbook 7375P tell — the put based, put volume outran calls, and it ran 0.54 →
+  9.90 into 4:00); a basing call side is bullish. Only fires inside the 3:50–3:55
+  window.
+- **The capitulation candle.** A contract's 1-minute **premium candle wicks far
+  above its own 5/9/200 EMAs** (an "instant buy & sell book" mechanical order)
+  then rejects with a red wick. It resolves **undercut-then-reclaim** — premium
+  dumps well below the wick first, then reverses back past it — so the clean entry
+  is the *reclaim after the undercut*, never the wick. This one fires **intraday
+  too**, not just in the MOC window.
+- **The 5-min candle-color heuristic.** The 5-minute index candle into 3:50,
+  mapped *inversely*: green → dump into MOC (bearish), red → pump/uppercut
+  (bullish). A weak drifting prior — it tilts a coin-flip, never carries a thesis.
+- **GEX context.** "Buy into overshoot, sell into pin": whether spot is pinned at
+  a wall / zero-Γ or has overshot the gamma envelope.
+
+A **setup briefing** auto-posts a few minutes before 3:50 (mirroring the
+pre-market briefing — a bias call, never graded), priming the window with the
+heuristic, GEX state, and which side's premium is leading. The reversal /
+capitulation candidates then fire live on top of it; Claude still renders every
+verdict. Per-contract premium OHLC comes from the real-time **StreamClient** feed
+(see below) when it's live — true 1-min wicks — and falls back to ~15s chain-poll
+folding when it isn't. `!moc` posts the board. Tunable in `MocConfig`.
+
+## Real-time streaming (schwab-py StreamClient)
+
+Helenus is otherwise REST-poll driven, which approximates intra-bar extremes by
+folding ~15s poll samples. `data/schwab_stream.py` adds a single **websocket**
+connection as an **additive, flag-gated** layer (`StreamConfig.enabled`, default
+on): when it's live the engines prefer streamed data, and when it's disabled or a
+stream goes stale they fall back to the existing poll path — so nothing breaks if
+streaming is unavailable or an entitlement is missing. It wires the three things
+Schwab actually streams that move the needle:
+
+- **`level_one_option`** on the ATM call/put → true per-contract premium ticks,
+  folded into real 1-minute premium OHLC **with wicks**. The MOC capitulation
+  candle literally can't see a 1-minute wick to 8.50 at 15s sampling; this is the
+  feed it needs. The bot re-points the option subscription at the current ATM
+  strikes as spot drifts, and `MocEngine.feed_stream` loads the streamed candle in
+  place of poll-folded marks (same fields, so `on_bar` is source-agnostic).
+- **`level_one_futures`** on `/ES` → real-time bid/ask size + volume, mapped into
+  the inner-quote shape `engine/intermarket.py` already reads (so the ES
+  microstructure refreshes on every tick instead of the 30s macro poll).
+- **`chart_equity`** on SPY → authoritative 1-minute OHLCV, used for the tape's
+  per-minute volume (the index *price* still comes from the `$SPX` poll — see the
+  placeholder note; Schwab doesn't stream the cash index).
+
+The connection runs a resilient login → subscribe → `handle_message` loop with
+exponential reconnect backoff; handlers are sync and only update freshest-state,
+which the bot pulls each bar/poll behind a staleness gate. `!stream` posts the
+live status board (which streams are fresh, the ATM subs, last-tick ages). The
+pure aggregation/mapping/diff logic is unit-tested without a socket; the live
+socket is covered by a manual smoke test. Tunable in `StreamConfig`. (Scalp's
+premium series stays on the 15s poll path for now — a candidate follow-up.)
 
 ## Accuracy feedback loop
 
@@ -82,7 +278,7 @@ Alerts and outcomes are written to an append-only JSONL journal
 
 - `!stats` — free deterministic scorecard (accuracy %, avg MFE/MAE/ratio, by
   trigger). No Claude call.
-- `!review` (and a daily auto-review at 16:30 ET) — Claude reads the graded
+- `!review` (and a daily auto-review at the market close, 16:00 ET) — Claude reads the graded
   history and surfaces the **patterns** separating accurate from inaccurate
   alerts (regime, vanna state, trend alignment, confidence vs outcome), logged as
   a `review` record.
@@ -102,9 +298,12 @@ Pre-market briefings are excluded from grading (they're a bias call, not an
 intraday entry). In-flight alerts are tracked in memory, so a restart drops their
 excursion tracking (the alert is still journaled).
 
-Discord commands: `!gex` (gamma board), `!scan` (tape internals), `!flow`
-(volume summary + vanna), `!stats` (accuracy scorecard), `!review` (Claude
-pattern review).
+Discord commands: `!gex` (gamma board), `!charm` (charm / delta-decay board),
+`!scalp` (EMA-ignition scalp board), `!disp` (displacement board), `!orb`
+(opening-range board), `!moc` (market-on-close board), `!scan` (tape internals),
+`!stream` (real-time feed status), `!flow` (volume summary + vanna), `!inter`
+(intermarket board), `!stats`
+(accuracy scorecard), `!review` (Claude pattern review).
 
 ### Offline retrospective (`scripts/`)
 
@@ -134,12 +333,21 @@ python main.py
 
 ## Tests
 
-The pure-math core — GEX (`engine/gex.py`) and options flow / vanna
-(`engine/flow.py`) — is tested offline with hand-computed fixtures (no Schwab
-key, no network):
+The pure-math core — GEX (`engine/gex.py`), charm (`engine/charm.py`), the
+EMA-ignition scalp (`engine/scalp.py`), displacement (`engine/displacement.py`),
+the ORB engine (`engine/orb.py`), the MOC engine (`engine/moc.py`), the streaming
+layer's pure pieces (`data/schwab_stream.py`), and options flow / vanna
+(`engine/flow.py`) — is tested offline with hand-computed fixtures (no Schwab key,
+no network):
 
 ```powershell
 python tests\test_gex.py      # standalone runner, no pytest needed
+python tests\test_charm.py
+python tests\test_scalp.py
+python tests\test_displacement.py
+python tests\test_orb.py
+python tests\test_moc.py
+python tests\test_stream.py
 python tests\test_flow.py
 python tests\test_journal.py
 
@@ -186,10 +394,11 @@ can be verified by hand against the assertions.
 
 ## Known structural placeholders (wire before going live)
 
-1. `bot.py` bar assembly aggregates intra-bar high/low from the running min/max
-   of chain-poll spot samples between bar closes (~15s resolution) — enough to
-   make sweep detection real. For tick-accurate extremes, switch to the
-   schwab-py `StreamClient` level-one equity stream and aggregate true OHLC.
+1. `bot.py` bar assembly still aggregates the **$SPX index** intra-bar high/low
+   from chain-poll spot samples (~15s) — because Schwab does **not** stream the
+   `$SPX` index (indices are screener-only symbols), so the index price tape
+   stays poll-based. The real-time `StreamClient` feed (below) covers what *is*
+   streamable — option premium, /ES, and SPY — but not the cash index itself.
 2. VIX "range boundaries" cold-start with a ±1.5 fallback band until enough
    history accumulates; persist `vix_history` to disk if you want real
    multi-day bands across restarts.

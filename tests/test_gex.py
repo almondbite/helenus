@@ -141,11 +141,42 @@ def test_zero_gamma_interpolation() -> None:
 
 def test_regime_and_cluster_distance() -> None:
     p = build_profile(_PAYLOAD)
-    # spot 100 sits above the 96 flip -> positive-gamma (mean-reverting) regime.
+    # spot 100 sits above the 96 flip AND total net GEX is positive (+40k) ->
+    # both reads agree, clean positive-gamma (mean-reverting) regime.
     assert p.regime == "POSITIVE_GAMMA"
     # A wall sits exactly at spot (the 100 strike), so nearest distance is 0.
     assert _approx(p.nearest_cluster_distance(100.0), 0.0)
     assert _approx(p.nearest_cluster_distance(103.0), 3.0)
+
+
+# Spot is ABOVE the first cumulative-zero flip (structural read = positive) but
+# total net GEX is negative — the contradiction the engine used to mislabel as a
+# clean POSITIVE_GAMMA. Net GEX by strike (units of OI*gamma * 10_000):
+#   90:  call 10*0.1 - put 30*0.1 = -2.0 -> -20_000   (cum -20_000)
+#  100:  call 35*0.1 - put 10*0.1 = +2.5 -> +25_000   (cum  +5_000 -> flip 90..100)
+#  110:  call 10*0.1 - put 40*0.1 = -3.0 -> -30_000   (total -25_000)
+_CONFLICT_PAYLOAD = _chain(
+    spot=100.0,
+    calls=[
+        _contract(90.0, 10, 0.10, 10),
+        _contract(100.0, 35, 0.10, 200),
+        _contract(110.0, 10, 0.10, 50),
+    ],
+    puts=[
+        _contract(90.0, 30, 0.10, 20),
+        _contract(100.0, 10, 0.10, 100),
+        _contract(110.0, 40, 0.10, 30),
+    ],
+)
+
+
+def test_regime_conflict_trusts_net_gex_sign() -> None:
+    p = build_profile(_CONFLICT_PAYLOAD)
+    # Flip sits below spot (structural read says positive) but total net GEX is
+    # negative -> resolve toward amplification and flag the conflict.
+    assert p.zero_gamma is not None and p.zero_gamma < p.spot
+    assert p.total_net_gex < 0
+    assert p.regime == "NEGATIVE_GAMMA_CONFLICTED"
 
 
 # --------------------------------------------------------------------------- #

@@ -1,5 +1,10 @@
 """
-Options-volume flow — the edge layer.
+Options-volume flow — the confluence layer.
+
+Read as CONFLUENCE that corroborates a setup, not a standalone edge: the main
+edges are the momentum/structural setups (the EMA-ignition scalp, the regime flip,
+displacement, the MOC plays), and the vanna rally / put-flow read confirms or
+fades them. It is demoted beneath those in the candidate gate (engine/scan2.py).
 
 Two things live here, both 0DTE-only (the chain is already pinned to today):
 

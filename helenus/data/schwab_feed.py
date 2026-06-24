@@ -152,21 +152,23 @@ class SchwabFeed:
     # Options chain
     # ------------------------------------------------------------------ #
 
-    async def fetch_0dte_chain(self) -> dict[str, Any]:
-        """
-        Raw 0DTE chain JSON for today's expiration only.
+    async def _fetch_0dte_chain(
+        self, symbol: str, root: str | None, strike_count: int
+    ) -> dict[str, Any]:
+        """Raw 0DTE chain JSON for `symbol`'s today-expiration only.
 
-        The chains endpoint only accepts the underlying ("$SPX"); "$SPXW" 400s.
-        Pinning from_date == to_date == today isolates today's expiration, and
-        _filter_contract_root keeps only the PM-settled SPXW contracts (the AM-
-        settled monthly shares the date on the 3rd Friday).
+        Pinning from_date == to_date == today isolates today's expiration. When
+        `root` is given, _filter_contract_root keeps only that contract root —
+        needed for $SPX (the chains endpoint only accepts "$SPX"; "$SPXW" 400s,
+        and the 3rd-Friday monthly shares the date with the PM-settled SPXW). SPY
+        and QQQ have a single weekly root, so they pass root=None (no-op filter).
         """
         await self.throttle.gate()
         today = now_et().date()
         resp = await self._client.get_option_chain(
-            CHAIN_SYMBOL,
+            symbol,
             contract_type=self._client.Options.ContractType.ALL,
-            strike_count=CONFIG.gex.strike_count,
+            strike_count=strike_count,
             from_date=today,
             to_date=today,
             include_underlying_quote=True,
@@ -174,19 +176,35 @@ class SchwabFeed:
         resp.raise_for_status()
         payload = resp.json()
         if payload.get("status") not in (None, "SUCCESS"):
-            log.warning("Chain status=%s", payload.get("status"))
-        # Strip AM-settled monthlies that share today's date on the 3rd Friday.
-        _filter_contract_root(payload, CHAIN_CONTRACT_ROOT)
+            log.warning("Chain %s status=%s", symbol, payload.get("status"))
+        if root:
+            payload = dict(payload)  # don't mutate a caller's reference
+            _filter_contract_root(payload, root)
         return payload
+
+    async def fetch_0dte_chain(self) -> dict[str, Any]:
+        """Raw 0DTE chain JSON for the $SPX underlying (PM-settled SPXW only)."""
+        return await self._fetch_0dte_chain(
+            CHAIN_SYMBOL, CHAIN_CONTRACT_ROOT, CONFIG.gex.strike_count
+        )
+
+    async def fetch_0dte_chain_for(self, symbol: str) -> dict[str, Any]:
+        """Raw 0DTE chain JSON for an intermarket leg (SPY/QQQ) — single weekly
+        root, so no contract-root filtering."""
+        return await self._fetch_0dte_chain(
+            symbol, None, CONFIG.intermarket.chain_strike_count
+        )
 
     # ------------------------------------------------------------------ #
     # Macro & proxy quotes
     # ------------------------------------------------------------------ #
 
     async def fetch_macro_quotes(self) -> dict[str, Any]:
-        """Single batched quote call: /CL, /GC, $VIX, the SPY volume proxy, and
-        the $SPX index itself — a spot + prior-close sample that does NOT depend
-        on the chain-poll cadence (which the throttle widens when vol is dead)."""
+        """Single batched quote call: the macro board (/CL, /GC, $VIX), the
+        intermarket Level-1 quotes folded into MACRO_SYMBOLS (/ES futures + QQQ),
+        the SPY volume proxy, and the $SPX index itself — a spot + prior-close
+        sample that does NOT depend on the chain-poll cadence (which the throttle
+        widens when vol is dead)."""
         await self.throttle.gate()
         symbols = list(MACRO_SYMBOLS) + [PROXY_SYMBOL, UNDERLYING_SYMBOL]
         resp = await self._client.get_quotes(symbols)

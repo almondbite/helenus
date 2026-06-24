@@ -63,6 +63,16 @@ def test_mixed() -> None:
     assert o.grade == "MIXED"
 
 
+def test_strong_excursion_but_negative_net_is_demoted() -> None:
+    # Big favorable MFE and a fine ratio, but the move came before/around entry
+    # and the held outcome is negative -> not ACCURATE, demoted to MIXED.
+    o = grade_excursion("BULLISH", entry=5000, high=5012, low=4998, last=4997, bars=30)
+    assert o.mfe_pts == 12.0
+    assert o.mfe_mae_ratio == 6.0              # 12 / 2, clears ratio_target
+    assert o.net_pts == -3.0
+    assert o.grade == "MIXED"
+
+
 def test_ratio_floor_no_div_by_zero() -> None:
     # No adverse excursion at all; ratio must stay finite via the mae floor.
     o = grade_excursion("BULLISH", entry=5000, high=5006, low=5000, last=5006, bars=30)

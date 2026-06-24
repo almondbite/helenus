@@ -77,9 +77,14 @@ def grade_excursion(
     """
     Pure MFE/MAE grade. Favorable is up for BULLISH, down for BEARISH.
 
-    ACCURATE   : MFE >= mfe_target AND MFE/MAE >= ratio_target
+    ACCURATE   : MFE >= mfe_target AND MFE/MAE >= ratio_target AND net_pts >= net_floor
     INACCURATE : MAE >= mae_stop  AND MFE < mfe_target
     MIXED      : everything else
+
+    The net_pts gate keeps a setup whose favorable excursion happened *before or
+    around entry* — strong MFE/ratio but a negative held outcome — out of the
+    ACCURATE bucket (demoted to MIXED). Without it the feedback loop rewards
+    thrusts that had already extended by the time the alert fired.
     """
     cfg = CONFIG.feedback
     if direction == "BULLISH":
@@ -92,7 +97,7 @@ def grade_excursion(
         net = entry - last
 
     ratio = mfe / max(mae, cfg.mae_floor_pts)
-    if mfe >= cfg.mfe_target_pts and ratio >= cfg.ratio_target:
+    if mfe >= cfg.mfe_target_pts and ratio >= cfg.ratio_target and net >= cfg.net_floor_pts:
         grade = "ACCURATE"
     elif mae >= cfg.mae_stop_pts and mfe < cfg.mfe_target_pts:
         grade = "INACCURATE"

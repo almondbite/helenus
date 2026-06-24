@@ -22,7 +22,8 @@ Candidate patterns the gate watches:
   * PREMARKET_SETUP — handled directly by the analyst before the open.
 
 Key levels tracked: round-number grid, prior-day close, session high/low,
-session VWAP, plus GEX walls injected from the gamma engine for confluence.
+session VWAP, plus GEX walls and charm (delta-decay) support/resistance walls
+injected from the gamma/charm engines for confluence.
 """
 
 from __future__ import annotations
@@ -38,10 +39,15 @@ import numpy as np
 import pandas as pd
 
 from helenus.config import CONFIG
+from helenus.engine.charm import CharmProfile
 from helenus.engine.gex import GexProfile
 
 if TYPE_CHECKING:
     from helenus.engine.flow import VannaReading
+    from helenus.engine.scalp import ScalpReading
+    from helenus.engine.displacement import DisplacementReading
+    from helenus.engine.orb import ORBReading
+    from helenus.engine.moc import MocReading
 
 
 class Direction(Enum):
@@ -58,6 +64,11 @@ class TriggerType(Enum):
     PREMARKET_SETUP = "Pre-Market Setup"
     VANNA_RALLY = "Vanna Rally"
     PUT_FLOW = "Put Flow Pressure"
+    EMA_IGNITION = "EMA Ignition"
+    DISPLACEMENT = "Displacement"
+    ORB_BREAKOUT = "ORB Breakout"
+    MOC_REVERSAL = "MOC Reversal"
+    CAPITULATION = "Capitulation Candle"
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,9 @@ class Signal:
     confidence: float           # 0..100, assigned by Claude
     trend_label: str            # e.g. "BULLISH WITH TREND"
     notes: list[str] = field(default_factory=list)
+    # The EMA-ignition scalp read attached when the gate fired on a 5/9 cross —
+    # carries the delta-targeted strike + premium target for the embed/journal.
+    scalp: "ScalpReading | None" = None
 
 
 @dataclass(frozen=True)
@@ -190,7 +204,12 @@ class MarketState:
 
     # -- levels ------------------------------------------------------------ #
 
-    def key_levels(self, spot: float, gex: GexProfile | None = None) -> list[KeyLevel]:
+    def key_levels(
+        self,
+        spot: float,
+        gex: GexProfile | None = None,
+        charm: CharmProfile | None = None,
+    ) -> list[KeyLevel]:
         levels: list[KeyLevel] = []
         step = CONFIG.scan.round_number_step
         major = CONFIG.scan.major_round_step
@@ -225,6 +244,17 @@ class MarketState:
                 )
             if gex.zero_gamma is not None:
                 levels.append(KeyLevel(float(gex.zero_gamma), "Zero-Γ", weight=0.9))
+
+        # Charm structure — the OTM-wing delta-decay walls dealers un-hedge into.
+        # Put-charm support and call-charm resistance are real reaction levels,
+        # most forceful in the afternoon (charm ∝ 1/T); a reaction at one is high
+        # confluence with the gamma walls it often sits near.
+        if charm is not None:
+            w = CONFIG.charm.wall_weight
+            for strike, _c in charm.support_walls:
+                levels.append(KeyLevel(float(strike), f"Charm Support {strike:.0f}", w))
+            for strike, _c in charm.resistance_walls:
+                levels.append(KeyLevel(float(strike), f"Charm Resist {strike:.0f}", w))
         return levels
 
 
@@ -236,29 +266,85 @@ def detect_candidate(
     state: MarketState,
     gex: GexProfile | None,
     vanna: "VannaReading | None" = None,
+    charm: CharmProfile | None = None,
+    scalp: "ScalpReading | None" = None,
+    displacement: "DisplacementReading | None" = None,
+    orb: "ORBReading | None" = None,
+    moc: "MocReading | None" = None,
 ) -> Candidate | None:
     """
     Cheap attention gate: is the latest bar interesting enough to spend a Claude
     call on? Returns a Candidate describing what tripped, or None.
 
     This makes no directional or confidence claim — that's the analyst's job.
-    Priority order, highest-information first:
-      1. an active flow setup — vanna rally (VIX falling + OTM call flow) or its
-         bearish analogue, put-flow pressure (VIX rising + OTM put flow),
-      2. a regime flip (spot crosses the zero-gamma pivot),
-      3. a liquidity sweep (pierce-and-reclaim of a key level),
-      4. a rejection at a high-value level (touch-and-reverse off a session
+    Priority order, highest-information first. The MAIN EDGES lead — the premium/
+    momentum and structural setups Helenus trades on — and the options-flow vanna
+    rally is a lower-priority *confluence* trigger beneath them (it corroborates a
+    setup; it's no longer the headline standalone signal):
+      1. a MOC reversal — inside the 3:50–3:55 close window, one side's premium
+         based while its volume surged vs the other (engine/moc.py); the priority
+         power-hour play, and rare (window-gated),
+      2. a capitulation candle — a contract's premium wicked above its 5/9/200
+         EMAs then rejected (engine/moc.py); a reversal heads-up, fires intraday,
+      3. an EMA ignition — a 1m 5/9 cross / 5-EMA reclaim that has already cleared
+         its full gate stack (regime, vanna headwind, SPX confirm, room, chop,
+         dual-bleed, spread) in engine/scalp.py; a primary momentum edge,
+      4. a regime flip (spot crosses the zero-gamma pivot),
+      5. a displacement — an institutional thrust that cleared the candle + FVG +
+         MSS pillars in engine/displacement.py,
+      6. an options-flow confluence — a vanna rally (VIX falling + OTM call flow)
+         or its bearish analogue, put-flow pressure (VIX rising + OTM put flow);
+         a corroborating flow signal, demoted below the main edges,
+      7. an ORB breakout — a close beyond the locked opening range with volume +
+         VWAP confirmation (engine/orb.py),
+      8. a liquidity sweep (pierce-and-reclaim of a key level),
+      9. a rejection at a high-value level (touch-and-reverse off a session
          extreme / GEX wall / zero-Γ),
-      5. a range-expansion thrust between levels (trend-day momentum),
-      6. a level cross on elevated volume.
+     10. a range-expansion thrust between levels (trend-day momentum),
+     11. a level cross on elevated volume.
     """
-    # Vanna fires independent of the bar tape — it's an options-flow event and
-    # is the signal we most want Claude to weigh in on. The bearish analogue
-    # (VIX rising + OTM put flow dominating) is dealer selling pressure.
-    if vanna is not None and vanna.active:
-        return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
-    if vanna is not None and vanna.bearish_active:
-        return Candidate(trigger=TriggerType.PUT_FLOW, level=None, reason=vanna.note)
+    # The MAIN EDGES lead: the premium/momentum and structural setups. The
+    # options-flow vanna rally is checked later, as a confluence trigger beneath
+    # them (it used to sit on top; it's now corroboration, not the headline).
+
+    # --- MOC reversal: the power-hour close play (premium + volume) ------- #
+    # Inside the 3:50–3:55 window, one side's premium based (a higher-low off a
+    # decline) while its fresh volume surged vs the other — the simplified
+    # premium-behavior reversal (engine/moc.py). The priority power-hour play and
+    # window-gated, so it's rare; it leads the order.
+    if moc is not None and moc.reversal_active:
+        level = (
+            KeyLevel(float(moc.nearest_wall), f"GEX {moc.gex_state}", 0.85)
+            if moc.nearest_wall is not None else None
+        )
+        return Candidate(trigger=TriggerType.MOC_REVERSAL, level=level, reason=moc.note)
+
+    # --- Capitulation candle: a premium wick rejection ------------------- #
+    # A contract's premium candle wicked above its own 5/9/200 EMAs then rejected
+    # (the "instant buy & sell book") — a reversal heads-up that resolves
+    # undercut-then-reclaim. Not window-gated: it happens intraday too.
+    if moc is not None and moc.capitulation:
+        level = (
+            KeyLevel(float(moc.nearest_wall), f"GEX {moc.gex_state}", 0.6)
+            if moc.nearest_wall is not None else None
+        )
+        return Candidate(trigger=TriggerType.CAPITULATION, level=level, reason=moc.note)
+
+    # --- EMA ignition: the gated 1m 5/9 contract scalp (a MAIN EDGE) ----- #
+    # The 1m 5/9 momentum confluence — one of Helenus's primary edges. The scalp
+    # engine already ran the whole confirmation stack (regime green, vanna not a
+    # headwind for the direction, SPX confirms on VWAP, room ≥ floor, chop-counter
+    # below threshold, no dual-bleed, acceptable spread); when `active` is set the
+    # cross has survived all of it. High-precision, so it sits in the top tier with
+    # the structural edges. It needs no gex/tape of its own (the reading already
+    # folded those in), so it's checked ahead of the structural guard below. The
+    # level it carries is the premium-translated target.
+    if scalp is not None and scalp.active:
+        return Candidate(
+            trigger=TriggerType.EMA_IGNITION,
+            level=scalp.target_level,
+            reason=scalp.note,
+        )
 
     if gex is None or len(state.bars) < 2:
         return None
@@ -269,7 +355,7 @@ def detect_candidate(
     # --- Regime flip: spot crosses the zero-gamma pivot ------------------ #
     # Positive↔negative gamma is the biggest structural state change there is:
     # dealers flip from damping moves (mean-reversion) to amplifying them
-    # (trend/expansion), or vice-versa. Highest-priority bar-driven event.
+    # (trend/expansion), or vice-versa. A top-tier structural edge.
     if gex.zero_gamma is not None:
         zg = float(gex.zero_gamma)
         crossed_up = prev.close < zg <= cur.close
@@ -286,11 +372,51 @@ def detect_candidate(
                 f"{'up' if crossed_up else 'down'} — regime now {regime}",
             )
 
+    # --- Displacement: the institutional thrust (candle + FVG + MSS) ----- #
+    # A sudden one-sided thrust that closed past a recent swing (MSS) and left a
+    # fair-value-gap imbalance — the footprint of smart-money flow. The hard
+    # pillars are already evaluated in engine/displacement.py; the broken swing is
+    # the structural level it carries.
+    if displacement is not None and displacement.active:
+        level = (
+            KeyLevel(float(displacement.mss_level), "MSS Break", 0.85)
+            if displacement.mss_level is not None else None
+        )
+        return Candidate(
+            trigger=TriggerType.DISPLACEMENT,
+            level=level,
+            reason=displacement.note,
+        )
+
+    # --- Options-flow confluence: the vanna rally / put-flow pressure ---- #
+    # DEMOTED from the headline trigger to a confluence setup: VIX falling with
+    # fresh OTM call flow outpacing puts (dealers hedge by buying → spot lifts), or
+    # the bearish mirror (VIX rising + OTM put flow → dealer selling). It can still
+    # wake Claude on a strong standalone reversal, but it now sits BENEATH the main
+    # premium/momentum/structural edges, so those lead the read and vanna
+    # corroborates. Fires off the flow read, independent of the level grid.
+    if vanna is not None and vanna.active:
+        return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
+    if vanna is not None and vanna.bearish_active:
+        return Candidate(trigger=TriggerType.PUT_FLOW, level=None, reason=vanna.note)
+
+    # --- ORB breakout: a confirmed close beyond the opening range -------- #
+    # The first-N-minute range is the session pivot; a close beyond it with
+    # volume + VWAP confirmation is the breakout (engine/orb.py applies both
+    # filters). The broken range edge is the entry level.
+    if orb is not None and orb.active and orb.entry is not None:
+        side = "ORB High" if orb.direction is Direction.BULLISH else "ORB Low"
+        return Candidate(
+            trigger=TriggerType.ORB_BREAKOUT,
+            level=KeyLevel(float(orb.entry), side, 0.85),
+            reason=orb.note,
+        )
+
     # --- Sweep & recover (needs 3 bars) ---------------------------------- #
     if len(state.bars) >= 3:
         before, pierce = state.bars[-3], state.bars[-2]
         depth = CONFIG.scan.sweep_pierce_pts
-        for level in state.key_levels(cur.close, gex):
+        for level in state.key_levels(cur.close, gex, charm):
             swept_low = (
                 before.close > level.price
                 and pierce.low <= level.price - depth
@@ -327,7 +453,7 @@ def detect_candidate(
         # they're real structure independent of the tape.
         rej_levels = [
             lv
-            for lv in state.key_levels(cur.close, gex)
+            for lv in state.key_levels(cur.close, gex, charm)
             if lv.weight >= CONFIG.scan.rejection_min_weight
             and lv.label not in ("Session High", "Session Low")
         ]
@@ -402,7 +528,7 @@ def detect_candidate(
     # --- Level cross on elevated volume ---------------------------------- #
     ratio = state.volume_ratio()
     if np.isfinite(ratio) and ratio >= CONFIG.analyst.gate_volume_ratio:
-        for level in state.key_levels(cur.close, gex):
+        for level in state.key_levels(cur.close, gex, charm):
             crossed_up = prev.close < level.price <= cur.close
             crossed_dn = prev.close > level.price >= cur.close
             if crossed_up or crossed_dn:
