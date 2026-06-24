@@ -144,6 +144,8 @@ def _scalp_plan(scalp: ScalpReading) -> str:
 def _scalp_flags(scalp: ScalpReading) -> str:
     """The EMA state + booster/avoidance flags for the scalp."""
     bits = [f"EMA `{scalp.ema_stack}` ({scalp.cross_type})"]
+    if scalp.slow_grind:
+        bits.append("⚠ slow grind (high+GEX)")
     if scalp.front_run:
         bits.append("🟢 front-run")
     if scalp.premium_divergence:
@@ -160,6 +162,9 @@ def _scalp_flags(scalp: ScalpReading) -> str:
 def _disp_line(d: DisplacementReading) -> str:
     """The displacement trade plan: candle stats, FVG retrace zone, MSS, sweep."""
     bits = [f"body `{abs(d.body_pts):.1f}pt` ({d.body_frac:.0%}) `{d.vol_ratio:.1f}x` vol"]
+    if d.trend_direction is not None and d.midpoint is not None:
+        held = "holds" if d.holding_above_mid else "lost"
+        bits.append(f"trend `{d.trend_direction.value}` ({held} 50% `{d.midpoint:.0f}`)")
     if d.fvg and d.fvg_low is not None:
         bits.append(f"FVG `{d.fvg_low:.0f}–{d.fvg_high:.0f}`")
     if d.mss and d.mss_level is not None:
@@ -443,10 +448,10 @@ def scalp_snapshot_embed(scalp: ScalpReading) -> discord.Embed:
 
     if scalp.direction is not None:
         gates = (
-            f"regime {_ok(scalp.regime_ok)} | vanna {_ok(scalp.vanna_ok)} | "
-            f"confirm {_ok(scalp.confirm_ok)} | room {_ok(scalp.room_ok)} | "
-            f"chop {_ok(scalp.chop_ok)} | bleed {_ok(scalp.bleed_ok)} | "
-            f"spread {_ok(scalp.spread_ok)}"
+            f"vanna {_ok(scalp.vanna_ok)} | confirm {_ok(scalp.confirm_ok)} | "
+            f"room {_ok(scalp.room_ok)} | chop {_ok(scalp.chop_ok)} | "
+            f"bleed {_ok(scalp.bleed_ok)} | spread {_ok(scalp.spread_ok)}"
+            + (" | ⚠ slow grind" if scalp.slow_grind else "")
         )
         _field(embed, "Gates", gates)
         _field(embed, "Plan", _scalp_plan(scalp))
@@ -483,7 +488,8 @@ def displacement_snapshot_embed(disp: DisplacementReading) -> discord.Embed:
     _field(embed, "Sweep", _ok(disp.swept), inline=True)
     _field(
         embed, "Verdict",
-        "🟢 **ACTIVE** — all pillars" if disp.active else "⛔ incomplete (see above)",
+        "🟢 **ACTIVE** — candle gate (FVG/MSS/sweep are boosters)"
+        if disp.active else "⛔ no qualifying displacement candle",
     )
     embed.set_footer(text=_footer())
     return _fit(embed)

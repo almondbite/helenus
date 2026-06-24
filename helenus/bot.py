@@ -133,8 +133,11 @@ class HelenusBot(commands.Bot):
         # Carry any prior learned lessons into this session's analysis.
         self.analyst.set_lessons(self.lessons.load())
 
-        # Macro tape
+        # Macro tape. $VIX (30-day) feeds the macro board + premarket band; $VIX1D
+        # (1-day / 0DTE vol) drives the vanna tracker — far more sensitive to the
+        # intraday vol crush the rally is built on.
         self.vix_history: deque[float] = deque(maxlen=500)
+        self.vix1d_history: deque[float] = deque(maxlen=500)
         self.macro_quotes: dict = {}
         # SPY cumulative volume read at each bar boundary (not async-accumulated),
         # so each bar's volume is the delta over exactly that bar — see bar_worker.
@@ -256,8 +259,12 @@ class HelenusBot(commands.Bot):
                     # the forming bar so high/low capture true intra-bar range.
                     self._observe_spot(self.profile.spot)
                     self.vol_profile = flow_engine.build_volume_profile(payload)
+                    # Vanna runs off $VIX1D, and is suppressed in the late-day
+                    # window where VIX1D ramps mechanically into the close.
                     self.vanna_reading = self.vanna.update(
-                        self.vol_profile, list(self.vix_history)
+                        self.vol_profile,
+                        list(self.vix1d_history),
+                        self._vix1d_eod_distortion(),
                     )
                     # Charm reads the same chain; minutes-to-expiry is the clock
                     # input (charm ∝ 1/T, so this is what makes it ramp into the
@@ -403,6 +410,10 @@ class HelenusBot(commands.Bot):
         vix = (quotes.get("$VIX", {}).get("quote") or {}).get("lastPrice")
         if vix:
             self.vix_history.append(float(vix))
+        # $VIX1D drives the vanna tracker (see chain_worker / VannaTracker).
+        vix1d = (quotes.get("$VIX1D", {}).get("quote") or {}).get("lastPrice")
+        if vix1d:
+            self.vix1d_history.append(float(vix1d))
 
         # /ES Level-1 microstructure (futures volume flow + resting bid/ask size).
         # Tracked here on the 30s macro cadence; the interval volume delta needs
@@ -522,6 +533,13 @@ class HelenusBot(commands.Bot):
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+
+    def _vix1d_eod_distortion(self) -> bool:
+        """True inside the late-day window where $VIX1D's measurement window
+        mechanically shrinks and ramps into the close — there the vanna trigger is
+        suppressed (the ramp is structural, not a real vol move)."""
+        cfg = CONFIG.flow
+        return now_et().time() >= dt.time(cfg.vix1d_distort_hour, cfg.vix1d_distort_minute)
 
     def _roll_stream_side(self, role: str):
         """Finalize the streamed ATM call/put premium candle for this bar (or None
@@ -650,6 +668,7 @@ class HelenusBot(commands.Bot):
                 {
                     "scalp_cross_type": sc.cross_type,
                     "scalp_ema_stack": sc.ema_stack,
+                    "scalp_slow_grind": sc.slow_grind,
                     "scalp_front_run": sc.front_run,
                     "scalp_premium_divergence": sc.premium_divergence,
                     "scalp_vanna_headwind": sc.vanna_headwind,
@@ -676,7 +695,12 @@ class HelenusBot(commands.Bot):
                     "disp_fvg_zone": [dr.fvg_low, dr.fvg_high]
                     if dr.fvg_low is not None else None,
                     "disp_mss_level": dr.mss_level,
+                    "disp_fvg": dr.fvg,
+                    "disp_mss": dr.mss,
                     "disp_swept": dr.swept,
+                    "disp_midpoint": dr.midpoint,
+                    "disp_holding_mid": dr.holding_above_mid,
+                    "disp_trend": dr.trend_direction.value if dr.trend_direction else None,
                 }
             )
         orb = self.orb_reading
@@ -930,6 +954,9 @@ async def cmd_scan(ctx: commands.Context) -> None:
         f"Bars: `{len(st.bars)}` | Vol ratio: `{ratio:.2f}x`" if ratio == ratio
         else f"Bars: `{len(st.bars)}` | Vol ratio: `building baseline`",
         f"Trend: `{trend.value if trend else 'NONE'}`",
+        f"Session H/L: `{st.session_high:.0f}` (×{st.high_retests}) / "
+        f"`{st.session_low:.0f}` (×{st.low_retests}) re-tests"
+        if st.bars else "Session H/L: `warming up`",
         "Levels: " + ", ".join(f"`{lv.label} {lv.price:.0f}`" for lv in levels[:6]),
     ]
     await ctx.send("\n".join(lines))

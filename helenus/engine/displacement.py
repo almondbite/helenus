@@ -2,22 +2,24 @@
 Displacement — the footprint of one-sided institutional ("smart money") flow.
 
 A displacement is a sudden, aggressive thrust: large, full-bodied candles with
-very small wicks, driven by massive one-sided volume. A big candle alone isn't a
-signal, though — to be tradeable the move must clear three structural pillars:
+very small wicks, driven by massive one-sided volume.
 
-  1. Liquidity sweep (the trap): the move starts right after price pierces a key
-     level / prior swing just enough to trip a cluster of stops, then reverses.
-  2. Market structure shift (MSS): the thrust closes decisively past a recent
-     swing high/low — proof the trend actually changed, not just a wick.
-  3. Fair value gap (FVG): because one side of the book can't keep up, the move
-     leaves a 3-candle imbalance — the wicks of the 1st and 3rd candle don't
-     overlap, leaving a gap price tends to revisit (a retrace target).
+Hard gate (decoupled): the **high-volume displacement candle itself** is the only
+required pillar — body ≥ an ATR multiple, mostly body (small wicks), on volume well
+above baseline. Everything else is a conviction **booster**, surfaced but not
+required (flip the matching `require_*` flag to harden one back into the gate):
 
-Engineering choice (see plan): the **displacement candle + FVG + MSS** are the
-hard gate — all three are crisply computable from the OHLCV tape. The **liquidity
-sweep** is fuzzier (over-requiring it suppresses valid setups), so it is detected
-and surfaced as a strong conviction *booster*; flip `CONFIG.displacement.
-require_sweep` to harden it into the gate once its parameters are tuned.
+  * Fair value gap (FVG): a 3-candle imbalance (1st/3rd wicks don't overlap),
+    leaving a gap price tends to revisit — a retrace target. (`require_fvg`)
+  * Market structure shift (MSS): the thrust closes past a recent swing high/low.
+    (`require_mss`)
+  * Liquidity sweep: the move began by piercing a prior swing to trip stops, then
+    reversed — the trap. (`require_sweep`)
+
+It also reads the candle's **50% midpoint trend**: institutions defend the half-way
+mark of their displacement, so price holding a bullish thrust's 50% = uptrend (look
+for calls) while a close back below it = they've flipped to sellers (puts); mirror
+for a bearish thrust.
 
 Pure and stateless — everything it needs is in the last ~N bars of MarketState.
 This is Claude's input, not its job: the gate emits a candidate, Claude judges.
@@ -37,8 +39,9 @@ from helenus.engine.scan2 import Direction, MarketState
 
 @dataclass(frozen=True)
 class DisplacementReading:
-    """One bar's displacement read: the thrust candle, the structure it broke, and
-    the imbalance it left. `active` = candle + FVG + MSS (+ sweep if required)."""
+    """One bar's displacement read: the thrust candle, the structure it broke, the
+    imbalance it left, and the 50% midpoint trend. `active` = the high-volume candle
+    (FVG / MSS / sweep are boosters unless their require_* flag is set)."""
     direction: Direction | None = None
     detected: bool = False              # a qualifying displacement candle exists
     body_pts: float = 0.0               # signed body of the displacement candle
@@ -48,10 +51,16 @@ class DisplacementReading:
     fvg_low: float | None = None        # imbalance zone (a retrace target)
     fvg_high: float | None = None
     mss: bool = False
-    mss_level: float | None = None      # the swing the thrust closed past
+    mss_level: float | None = None      # the swing the thrust closed past (booster)
     swept: bool = False                 # booster — stop-hunt pierce before the move
     swept_level: float | None = None
-    active: bool = False
+    # 50%-of-range midpoint trend confirmation: price holding the bullish thrust's
+    # half-way mark = institutions defending longs (calls); a close back below it =
+    # they've flipped to sellers (puts). Mirror for a bearish thrust.
+    midpoint: float | None = None
+    holding_above_mid: bool = False
+    trend_direction: Direction | None = None
+    active: bool = False                # = the high-volume candle (FVG/MSS/sweep boost)
     note: str = ""
 
 
@@ -66,8 +75,9 @@ def build_displacement(
     cfg: DisplacementConfig | None = None,
 ) -> DisplacementReading:
     """Evaluate the last three bars as an FVG triple — `c1` (bars[-3]), the
-    displacement candle `c2` (bars[-2]), and `c3` (bars[-1]) — against the
-    displacement / FVG / MSS pillars. Returns a `DisplacementReading`."""
+    displacement candle `c2` (bars[-2]), and `c3` (bars[-1]) — against the candle
+    hard gate plus the FVG / MSS / sweep boosters and the 50% midpoint trend.
+    Returns a `DisplacementReading`."""
     cfg = cfg or CONFIG.displacement
     bars = list(state.bars)
     if len(bars) < 3:
@@ -121,10 +131,30 @@ def build_displacement(
     # --- Liquidity sweep (booster): a stop-hunt before the move ---------- #
     swept, swept_level = _detect_sweep(bars, direction, c2, cfg)
 
-    active = candle_ok and fvg and mss and (swept or not cfg.require_sweep)
+    # --- 50% midpoint trend confirmation -------------------------------- #
+    # The defended half-way mark of the displacement candle. For a bullish thrust,
+    # the latest close holding ≥ midpoint = uptrend (calls); a close back below it =
+    # the move was sold, trend flipped down (puts). Mirror for a bearish thrust.
+    rng2 = c2.high - c2.low
+    midpoint = (c2.low + rng2 * cfg.mid_fraction) if rng2 > 0 else c2.close
+    holding_above_mid = c3.close >= midpoint
+    if direction is Direction.BULLISH:
+        trend_direction = Direction.BULLISH if holding_above_mid else Direction.BEARISH
+    else:
+        trend_direction = Direction.BEARISH if not holding_above_mid else Direction.BULLISH
+
+    # The high-volume displacement CANDLE is the only hard gate now; FVG, MSS, and
+    # the sweep are conviction boosters (flip a require_* flag to harden one).
+    active = (
+        candle_ok
+        and (fvg or not cfg.require_fvg)
+        and (mss or not cfg.require_mss)
+        and (swept or not cfg.require_sweep)
+    )
 
     note = _note(direction, body, body_frac, vol_ratio, fvg, fvg_low, fvg_high,
-                 mss, mss_level, swept, swept_level, candle_ok, active)
+                 mss, mss_level, swept, swept_level, midpoint, holding_above_mid,
+                 trend_direction, candle_ok, active)
 
     return DisplacementReading(
         direction=direction if candle_ok else None,
@@ -139,6 +169,9 @@ def build_displacement(
         mss_level=round(mss_level, 2) if mss_level is not None else None,
         swept=swept,
         swept_level=round(swept_level, 2) if swept_level is not None else None,
+        midpoint=round(midpoint, 2) if candle_ok else None,
+        holding_above_mid=holding_above_mid if candle_ok else False,
+        trend_direction=trend_direction if candle_ok else None,
         active=active,
         note=note,
     )
@@ -168,7 +201,8 @@ def _detect_sweep(bars, direction, c2, cfg: DisplacementConfig):
 
 
 def _note(direction, body, body_frac, vol_ratio, fvg, fvg_low, fvg_high,
-          mss, mss_level, swept, swept_level, candle_ok, active) -> str:
+          mss, mss_level, swept, swept_level, midpoint, holding_above_mid,
+          trend_direction, candle_ok, active) -> str:
     if not candle_ok:
         return "no qualifying displacement candle"
     d = direction.value
@@ -176,6 +210,9 @@ def _note(direction, body, body_frac, vol_ratio, fvg, fvg_low, fvg_high,
         f"{d} displacement",
         f"body {abs(body):.1f}pt ({body_frac:.0%} fill) {vol_ratio:.1f}x vol",
     ]
+    if trend_direction is not None and midpoint is not None:
+        held = "holding" if holding_above_mid else "lost"
+        parts.append(f"trend {trend_direction.value} ({held} 50% @ {midpoint:.0f})")
     parts.append(
         f"FVG {fvg_low:.0f}-{fvg_high:.0f}" if fvg and fvg_low is not None else "no FVG"
     )

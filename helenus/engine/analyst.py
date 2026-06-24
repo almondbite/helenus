@@ -66,13 +66,18 @@ HOW TO READ THE DATA YOU ARE GIVEN
   read its DIRECTION. The snapshot pre-computes the room on each side: \
   `gex.dist_to_overhead_magnet_pts` (nearest call wall above, or VWAP when spot \
   is below it) and `gex.dist_to_support_below_pts` (nearest put wall below, or \
-  VWAP when spot is above it). HARD RULE: do not issue a long when the overhead \
-  magnet is < ~8pt away — there is no room to run and the move gets faded into \
-  it, even with supportive charm (this was a repeated miss). Symmetrically, do \
-  not short when support below is < ~8pt away. Reward the opposite: a wall \
-  flipped to support behind price with the nearer magnet ≥8pt away = clear air to \
-  run into. A move INTO a magnet a few points away is mean-reversion risk, not \
-  confirmation.
+  VWAP when spot is above it). ROOM RULE (graduated by setup): for the MOMENTUM \
+  edges — an EMA ignition or a displacement — require only ~4pt of room to the \
+  nearest opposing magnet (we want the smaller base hits; below ~4pt it's a fade, \
+  not a trade). For everything else — charm-driven longs and mid-range reclaims — \
+  hold the stricter ~8pt: a long into an overhead magnet < ~8pt away there gets \
+  faded even with supportive charm (a repeated miss). EXCEPTION even for momentum: \
+  a SHORT into a stacked PUT-wall cluster (or a long into a stacked CALL-wall \
+  cluster) keeps the full ~8pt requirement regardless of setup — stacked same-side \
+  walls are heavy gamma that absorbs the move (a graded short with 8.6pt into \
+  three stacked put walls still failed). Reward the opposite: a wall flipped to \
+  support behind price with clear air to the next magnet. A move INTO a magnet only \
+  a point or two away is mean-reversion risk, not confirmation.
 - Charm (delta-decay) structure: the `charm` block reads the OTM-wing dealer \
   un-hedging. `bias` SUPPORTIVE means OTM-put charm dominates — dealers who \
   shorted futures to hedge those puts buy them back as the puts decay, putting a \
@@ -92,6 +97,12 @@ HOW TO READ THE DATA YOU ARE GIVEN
   issuing a charm-driven long — if OTM call/put flow is actually ≤ 1, treat \
   SUPPORTIVE charm as weak background, not a thesis. Graded outcomes show \
   charm-only longs (especially midday and late power-hour reclaims) underperform.
+  THE MIRROR — A SHORT VETO (the single biggest graded failure cluster): do NOT \
+  issue a short when HIGH-intensity SUPPORTIVE charm, an OTM call-flow lead \
+  (`otm_call_put_ratio` > ~1.1), AND a bid-heavy /ES (positive `es.imbalance`) all \
+  oppose it. Those three co-occurred in every failed afternoon short — a melt-up \
+  floor plus contra-flow that snapped each break back up. When two or three are \
+  present against a short, treat it as a hard cap (well below 50) or has_signal=false.
 - Key levels: round-number grid, prior close, session high/low, session VWAP. A \
   reaction *at* a level matters more than one in open air.
 - VWAP: the session's volume-weighted average price and the day's gravity line. \
@@ -109,13 +120,16 @@ HOW TO READ THE DATA YOU ARE GIVEN
   expand (give breaks more benefit of the doubt); MIDDAY_LULL setups fade more \
   and need tighter confluence to be worth an alert.
 
-OPTIONS FLOW & THE VANNA RALLY — A CONFLUENCE (corroborate, don't lead)
-Read options flow as CONFLUENCE: it strengthens or weakens a setup, but it is no \
-longer a standalone thesis on its own. Your MAIN EDGES are the momentum/structural \
-setups — the EMA-ignition scalp, the regime flip, displacement, and the MOC plays; \
-flow confirms or fades them rather than leading. You are given 0DTE option volume \
-split into ITM/OTM for calls and puts, plus where volume sits above vs below spot, \
-plus a live vanna reading.
+OPTIONS FLOW & THE VANNA RALLY — A PRIMARY, STANDALONE TRIGGER
+This is a primary signal: an extreme OTM call/put flow skew with VIX1D dropping (or \
+rising) is enough to fire on its own, regardless of whether a chart pattern is \
+present — it ranks just under the GEX regime flip. The vanna read is driven by \
+**$VIX1D** (1-day implied vol), which reacts to the intraday 0DTE vol crush far \
+faster than the 30-day VIX. CAVEAT: VIX1D ramps mechanically into the close (its \
+measurement window shrinks), so the engine suppresses the trigger in the final \
+minutes — if you see a late-day VIX1D spike, that's structural, not a vol event. \
+You are given 0DTE option volume split into ITM/OTM for calls and puts, plus where \
+volume sits above vs below spot, plus a live vanna reading.
 - `otm_call_put_ratio` rising means traders are paying up for upside lottery \
   tickets — directional speculation, not hedging. Heavy OTM *put* volume below \
   spot is the opposite (downside demand / hedging).
@@ -126,10 +140,9 @@ plus a live vanna reading.
   interval volume) outpacing OTM put flow. When `vanna.active` is true, treat it \
   as a strong bullish influence — ESPECIALLY if the tape has been falling hard, \
   because that is the classic reversal: sellers exhaust, VIX rolls over, call \
-  flow + dealer hedging snaps price back up. So an active vanna setup is strong \
-  CONFIRMATION for a long when a primary setup lines up with it (and a reason not \
-  to stay reflexively bearish into it) — but on its own it corroborates; it does \
-  not carry the alert.
+  flow + dealer hedging snaps price back up. A falling-VIX1D tape with active \
+  vanna is a high-conviction long signal in its own right, not a reason to stay \
+  bearish — and it can carry the alert standalone.
 - PUT-FLOW PRESSURE (the bearish mirror): when VIX *rises*, puts are the demand — \
   buyers pile into OTM puts and dealers short those puts hedge by SELLING the \
   underlying, pressuring spot down. `vanna.bearish_active` flags this (`vix \
@@ -154,7 +167,10 @@ warns against it.
   `volume_flow` is fresh futures participation this interval, `pct_change` the \
   intraday lean. Heavy one-sided resting size and rising flow in the signal's \
   direction is real institutional intent behind the move; opposing order-book \
-  tilt is a caution.
+  tilt is a caution. HARD CAUTION: a strongly OPPOSING imbalance (|`es.imbalance`| \
+  > ~0.4 against your trade direction) was present in most graded failures — \
+  subtract real conviction for it even when the gate and breadth otherwise align, \
+  and flag it as a risk.
 - `spy` and `qqq` give each proxy's intraday `direction` (%-vs-prior-close lean) \
   and dealer-gamma `regime`. QQQ (semi/tech-heavy) is the lead breadth tell. \
   Genuine breadth = the complex moving together: QQQ and SPY leaning the same way \
@@ -173,11 +189,16 @@ targeting a structural level pre-translated into option premium. The raw cross i
 the trigger, NOT the edge — the edge is the FILTERING stack that already ran, and \
 that gated stack is exactly what makes this a primary setup rather than a noisy \
 scalp. When `gate_pattern` is \
-"EMA Ignition" the `scalp` block's gates (regime green, no vanna headwind for the \
-direction, SPX confirmed on VWAP, room-to-target ≥ floor, chop-counter below \
-threshold, no dual-bleed, acceptable spread) have ALL passed mechanically — your \
-job is to confirm the confluence is genuinely tradeable, not to re-derive the \
-gates. Read it like this:
+"EMA Ignition" the `scalp` block's gates (no vanna headwind for the direction, SPX \
+confirmed on VWAP, room-to-target ≥ ~4pt, chop-counter below threshold, no \
+dual-bleed, acceptable spread) have ALL passed mechanically — your job is to \
+confirm the confluence is genuinely tradeable, not to re-derive the gates. Read it \
+like this:
+- `slow_grind` true = the cross fired in HIGH-POSITIVE GEX (dealers damp moves). \
+  Regime is no longer a hard block, so these now reach you — treat them as a \
+  slower, lower-conviction grind: temper the target and confidence, prefer the \
+  `reclaim` cross_type, and don't expect a clean expansion. It's a real setup, just \
+  not an A+ one.
 - `cross_type`: a `reclaim` (price reclaimed the 5-EMA off a defined local bottom) \
   is higher quality than a raw `cross` — it has a built-in invalidation.
 - `front_run` true = the selected contract's own premium already crossed in the \
@@ -200,19 +221,29 @@ gates. Read it like this:
 
 DISPLACEMENT — the institutional thrust (the `displacement` block)
 A displacement is the footprint of one-sided "smart money" flow: a sudden, \
-aggressive, full-bodied candle on heavy volume. The `displacement` block fires \
-when three pillars align: a qualifying candle (`body_fill_frac` high = small \
-wicks, `volume_ratio` elevated), a **market structure shift** (`mss` true = the \
-thrust closed past a recent swing at `mss_level`, proof the trend turned), and a \
-**fair value gap** (`fvg` true = a 3-candle imbalance at `fvg_zone`, which price \
-tends to revisit — a high-quality RETRACE ENTRY zone, not a chase). \
-`liquidity_sweep` true is the strongest version: the move began by running stops \
-beyond `swept_level` then reversing (the trap). Read it as a genuine momentum/ \
-reversal signal in the thrust's direction — but the cleanest entry is a pullback \
-INTO the `fvg_zone`, so if price has already extended far past it toward an \
-opposing GEX wall, flag the chase risk and lean lower-confidence. Displacement \
-WITH the gamma regime (negative/amplification) and a sweep is A-tier; a \
-displacement straight into a near overhead magnet is not.
+aggressive, full-bodied candle on heavy volume. The HARD GATE is now the candle \
+ITSELF (`body_fill_frac` high = small wicks, `volume_ratio` elevated) — the FVG, \
+MSS, and sweep are conviction BOOSTERS, not requirements:
+- `mss` true = the thrust closed past a recent swing at `mss_level` (trend turned); \
+  `fvg` true = a 3-candle imbalance at `fvg_zone`, a high-quality RETRACE ENTRY \
+  zone (the cleanest entry is a pullback INTO it, not a chase); `liquidity_sweep` \
+  true = the move ran stops beyond `swept_level` then reversed (the trap). The more \
+  of these present, the higher the conviction; a bare candle with none is the \
+  weakest version — say so and lean lower-confidence. GRADED FLOOR: a bare \
+  displacement (no FVG, no MSS, no sweep) that has ALREADY LOST its 50% midpoint, \
+  with balanced/opposing /ES, is the weakest version there is and graded \
+  INACCURATE — has_signal=false. And do NOT chase an already-extended thrust: when \
+  the move is >~3x ATR and the triggering bar closes at its extreme AGAINST a \
+  continuation entry, that's buying the top/bottom — has_signal=false.
+- 50% MIDPOINT TREND (`trend_direction` / `holding_above_mid` / `midpoint`): \
+  institutions defend the half-way mark of their displacement. On a bullish thrust, \
+  price HOLDING ≥ the 50% midpoint = they're defending longs → an uptrend, look for \
+  CALLS; a close back BELOW it = they've flipped to net sellers → trend reversed \
+  down, look for PUTS (mirror for a bearish thrust). Let `trend_direction` lead the \
+  directional read; it's the freshest tell of who's in control.
+Displacement WITH the gamma regime (negative/amplification), holding its 50% mark, \
+and a sweep/FVG is A-tier; a thrust that's already lost its midpoint or is running \
+straight into a near opposing magnet is not.
 
 OPENING RANGE BREAKOUT — the session pivot (the `orb` block)
 The `orb` block locks the high/low of the first minutes after the open; a bar \
@@ -269,16 +300,29 @@ structure + level + volume + trend + regime actually warrants an alert.
   and is the highest-tier setup. A reclaim of a level in the MIDDLE of the range, \
   with magnets either side, is lower-tier: demand tighter confluence and lean \
   toward has_signal=false, especially in MIDDAY_LULL / late POWER_HOUR.
+- RE-TEST FATIGUE — the `session` block gives `high_retests` / `low_retests`: the \
+  number of DISTINCT times the running session extreme has already been re-tagged \
+  and HELD. A high count (≥ ~3) means an exhausted shelf, NOT a fresh extreme — a \
+  same-direction break there (a short into a many-times-held `low_retests` low, a \
+  long into a held high) is exhaustion, not opportunity: has_signal=false, and do \
+  not describe it with fresh-extreme language. The graded failure was a string of \
+  afternoon shorts fired into the same held session-low shelf, each one bleeding as \
+  the move was already spent.
 - When has_signal=true, give the directional read, a calibrated confidence \
   (0-95 — never claim certainty), a tight one-paragraph thesis grounded in the \
   specific levels/walls/regime in front of you, and explicit risk_flags \
   (what would invalidate it, what's conflicting).
 - CONFIDENCE CALIBRATION: reserve >60 for the textbook setup — a with-trend break \
-  at a FRESH session extreme, clear path (volume_skew on your side, overhead/ \
-  support magnet ≥8pt away), in amplification (negative net GEX), with no opposing \
-  vanna/flow. Mid-range reclaims, moves into a near magnet, or anything leaning on \
-  charm alone belong below ~55, and the most marginal of those should be \
-  has_signal=false rather than a low-confidence alert.
+  at a FRESH session extreme, clear path (volume_skew on your side, ample room to \
+  the nearest opposing magnet — comfortably beyond the ~4pt momentum floor), in \
+  amplification (negative net GEX), with no opposing vanna/flow. Smaller base-hit \
+  scalps (~4–8pt of room), slow-grind ignitions in positive GEX, mid-range \
+  reclaims, or anything leaning on charm alone belong below ~55; the most marginal \
+  of those should be has_signal=false rather than a low-confidence alert. Push \
+  contra-confluence afternoon shorts (the charm/call-flow/bid-heavy-ES veto above) \
+  and exhausted re-test breaks well below 50 — or off entirely; the graded data \
+  shows the 53-66 band did not separate winners from losers, so these belong nowhere \
+  near it.
 
 Respond ONLY with the JSON object the schema defines. No preamble.\
 """
@@ -336,10 +380,12 @@ def _macro_board(macro: dict[str, Any]) -> dict[str, Any]:
         return (macro.get(sym, {}) or {}).get("quote") or {}
 
     vix = q("$VIX")
+    vix1d = q("$VIX1D")
     cl = q("/CL")
     gc = q("/GC")
     return {
-        "vix_last": vix.get("lastPrice"),
+        "vix_last": vix.get("lastPrice"),          # 30-day, broad regime context
+        "vix1d_last": vix1d.get("lastPrice"),      # 1-day / 0DTE vol (drives vanna)
         "cl_pct": cl.get("netPercentChange"),
         "gc_pct": gc.get("netPercentChange"),
     }
@@ -469,6 +515,7 @@ def _scalp_block(scalp: ScalpReading | None) -> dict[str, Any]:
         "ema_trend": round(scalp.ema_trend, 2) if scalp.ema_trend is not None else None,
         "front_run": scalp.front_run,
         "premium_divergence": scalp.premium_divergence,
+        "slow_grind": scalp.slow_grind,     # fired in high-positive GEX (dealer-damped)
         "vanna_headwind": scalp.vanna_headwind,
         "chop_count": scalp.chop_count,
         "dual_bleed": scalp.dual_bleed,
@@ -489,9 +536,9 @@ def _scalp_block(scalp: ScalpReading | None) -> dict[str, Any]:
 
 
 def _displacement_block(disp: DisplacementReading | None) -> dict[str, Any]:
-    """The institutional-displacement read — the thrust candle, the structure it
-    broke (MSS), the fair-value-gap retrace zone, and the liquidity-sweep booster.
-    Only populated when a qualifying displacement candle exists this bar."""
+    """The institutional-displacement read — the thrust candle (the hard gate), the
+    FVG / MSS / sweep boosters, and the 50% midpoint trend. Only populated when a
+    qualifying displacement candle exists this bar."""
     if disp is None or not disp.detected:
         return {"available": False}
     return {
@@ -500,6 +547,11 @@ def _displacement_block(disp: DisplacementReading | None) -> dict[str, Any]:
         "body_pts": disp.body_pts,
         "body_fill_frac": disp.body_frac,
         "volume_ratio": disp.vol_ratio,
+        # 50% midpoint trend — the freshest read of who's in control (calls vs puts).
+        "midpoint": disp.midpoint,
+        "holding_above_mid": disp.holding_above_mid,
+        "trend_direction": disp.trend_direction.value if disp.trend_direction else None,
+        # Boosters (not required for the candle to fire):
         "fvg": disp.fvg,
         "fvg_zone": (
             [disp.fvg_low, disp.fvg_high]
@@ -509,7 +561,7 @@ def _displacement_block(disp: DisplacementReading | None) -> dict[str, Any]:
         "mss_level": disp.mss_level,
         "liquidity_sweep": disp.swept,
         "swept_level": disp.swept_level,
-        "all_pillars_pass": disp.active,
+        "candle_gate_pass": disp.active,
     }
 
 
@@ -659,6 +711,10 @@ def _snapshot(
         # (magnets either side, lower tier). Small distance = AT the extreme.
         "dist_from_high_pts": round(hi - spot, 2) if has_hi else None,
         "dist_from_low_pts": round(spot - lo, 2) if has_lo else None,
+        # Re-test fatigue: distinct times the running session high/low has been
+        # re-tagged and HELD. A high count = an exhausted shelf, not a fresh extreme.
+        "high_retests": state.high_retests,
+        "low_retests": state.low_retests,
     }
     return {
         "spot": round(spot, 2),

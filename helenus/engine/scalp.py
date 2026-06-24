@@ -13,8 +13,9 @@ So the cross is treated as the *trigger, not the edge — the edge is the
 filtering*. This module wraps it in a gated confirmation stack and reuses the
 structure Helenus already computes:
 
-  Gate 0 — Regime    : momentum only in negative/transition GEX (green); stand
-                       down in high-positive GEX (red, dealers fade every push).
+  Gate 0 — Regime    : advisory, NOT a hard block. Negative/transition GEX (green)
+                       is the friendly tape; high-positive GEX (red) still fires but
+                       is flagged `slow_grind` (dealer-damped) for the analyst to temper.
   Gate 1 — Vanna     : per-direction premium-vega headwind (falling IV bleeds a
                        long option's premium); see `vanna_headwind`.
   Gate 2 — Confirm   : SPX itself confirms (price on the trade-side of VWAP).
@@ -336,6 +337,7 @@ class ScalpReading:
     spread_ok: bool = True
     # Gate booleans
     regime_ok: bool = False
+    slow_grind: bool = False            # fired in high-positive GEX (dealer-damped)
     vanna_ok: bool = False
     confirm_ok: bool = False
     room_ok: bool = False
@@ -488,14 +490,19 @@ class ScalpEngine:
         )
         premium_div = self._premium_divergence(state, direction)
 
+        # Gate 0 (regime) is no longer a HARD block: momentum may fire in high-
+        # positive GEX too — it's just flagged as a dealer-damped "slow grind" for
+        # the analyst to temper, not auto-rejected.
+        slow_grind = regime_tag == "red"
         active = (
-            regime_ok and vanna_ok and confirm_ok and room_ok
+            vanna_ok and confirm_ok and room_ok
             and chop_ok and bleed_ok and spread_ok and contract is not None
         )
 
         note = self._note(
             direction, cross_type, regime_tag, room, chop_count, dual_bleed,
-            headwind, front_run, premium_div, contract, target_level, prem_target, active,
+            headwind, front_run, premium_div, contract, target_level, prem_target,
+            slow_grind, active,
         )
 
         return ScalpReading(
@@ -516,6 +523,7 @@ class ScalpEngine:
             room_to_level_pts=room,
             spread_ok=spread_ok,
             regime_ok=regime_ok,
+            slow_grind=slow_grind,
             vanna_ok=vanna_ok,
             confirm_ok=confirm_ok,
             room_ok=room_ok,
@@ -563,9 +571,10 @@ class ScalpEngine:
         return reclaim_up, reclaim_dn
 
     def _regime_ok(self, gex: GexProfile | None) -> tuple[bool, str]:
-        """Gate 0: momentum is friendly in negative/transition GEX (green) and
-        hostile in high-positive GEX (red — dealers fade every push). A conflicted
-        positive label is treated as transition (amber: allowed, noted)."""
+        """Gate 0 (advisory): momentum is friendly in negative/transition GEX
+        (green) and dealer-damped in high-positive GEX (red). No longer a hard
+        block — `red` just sets the `slow_grind` flag; a conflicted positive label
+        is treated as transition (amber)."""
         if gex is None:
             return False, "no-gex"
         regime = gex.regime
@@ -628,7 +637,8 @@ class ScalpEngine:
 
     def _note(
         self, direction, cross_type, regime_tag, room, chop_count, dual_bleed,
-        headwind, front_run, premium_div, contract, target_level, prem_target, active,
+        headwind, front_run, premium_div, contract, target_level, prem_target,
+        slow_grind, active,
     ) -> str:
         d = direction.value
         trig = "5/9 cross" if cross_type == "cross" else "5 EMA reclaim"
@@ -640,6 +650,8 @@ class ScalpEngine:
             tgt = f" → {prem_target:.2f}" if prem_target is not None else ""
             parts.append(f"{strike} @ {contract.premium:.2f}{tgt}")
         flags = []
+        if slow_grind:
+            flags.append("slow grind (high+GEX)")
         if headwind:
             flags.append("vanna headwind")
         if dual_bleed:

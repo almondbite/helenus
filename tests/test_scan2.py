@@ -311,6 +311,73 @@ def test_no_vwap_level_before_any_volume() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Priority order: regime flip > vanna/flow > EMA ignition
+# --------------------------------------------------------------------------- #
+
+def _vanna_stub(active=False, bearish_active=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(active=active, bearish_active=bearish_active, note="vanna")
+
+
+def _scalp_stub(active=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(active=active, target_level=None, note="ema ignition")
+
+
+def test_vanna_outranks_ema_ignition() -> None:
+    # No regime flip (zero-Γ far away); both vanna and an EMA ignition are live —
+    # the primary flow trigger wins (ranked #2, ahead of EMA at #3).
+    st = MarketState()
+    st.push_bar(_bar(7445.0))
+    st.push_bar(_bar(7446.0))
+    cand = detect_candidate(
+        st, _gex(spot=7446.0, zero_gamma=7600.0),
+        vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
+    )
+    assert cand is not None and cand.trigger is TriggerType.VANNA_RALLY
+
+
+def test_regime_flip_outranks_vanna() -> None:
+    # A zero-gamma cross plus an active vanna — the GEX regime flip leads (#1).
+    st = MarketState()
+    st.push_bar(_bar(7405.0))                     # below the pivot
+    st.push_bar(_bar(7415.0))                     # crosses zero-Γ 7410 up
+    cand = detect_candidate(
+        st, _gex(spot=7415.0, zero_gamma=7410.0),
+        vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
+    )
+    assert cand is not None and cand.trigger is TriggerType.REGIME_FLIP
+
+
+# --------------------------------------------------------------------------- #
+# Re-test fatigue counter (exhausted-shelf tell)
+# --------------------------------------------------------------------------- #
+
+def test_session_low_retests_count_distinct_holds() -> None:
+    st = MarketState()
+    st.push_bar(_bar(7400.0, l=7400.0))      # establish the session low at 7400
+    assert st.session_low == 7400.0 and st.low_retests == 0
+    st.push_bar(_bar(7410.0, l=7408.0))      # price moves off the shelf (> prox)
+    st.push_bar(_bar(7401.0, l=7401.0))      # returns within prox of 7400 → re-test 1
+    assert st.low_retests == 1
+    st.push_bar(_bar(7402.0, l=7401.5))      # keeps hugging it → still ONE distinct test
+    assert st.low_retests == 1
+    st.push_bar(_bar(7412.0, l=7409.0))      # off the shelf again
+    st.push_bar(_bar(7400.5, l=7400.2))      # back within prox → re-test 2
+    assert st.low_retests == 2
+
+
+def test_new_session_low_resets_the_shelf() -> None:
+    st = MarketState()
+    st.push_bar(_bar(7400.0, l=7400.0))
+    st.push_bar(_bar(7410.0, l=7408.0))
+    st.push_bar(_bar(7401.0, l=7401.0))      # re-test 1 of the 7400 shelf
+    assert st.low_retests == 1
+    st.push_bar(_bar(7390.0, l=7390.0))      # a NEW low → fresh shelf, count resets
+    assert st.session_low == 7390.0 and st.low_retests == 0
+
+
+# --------------------------------------------------------------------------- #
 # Standalone runner (no pytest required)
 # --------------------------------------------------------------------------- #
 

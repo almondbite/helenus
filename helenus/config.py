@@ -57,9 +57,15 @@ PROXY_SYMBOL: str = "SPY"          # volume proxy — the index itself prints no
 QQQ_SYMBOL: str = "QQQ"
 ES_SYMBOL: str = "/ES"
 
+# Cboe's 1-day volatility index — implied vol of SPX options expiring TODAY. The
+# 0DTE-native vol gauge, far more sensitive to intraday option crushes than the
+# 30-day $VIX, so it drives the vanna tracker (see FlowConfig / VannaTracker).
+VIX1D_SYMBOL: str = "$VIX1D"
+
 # /ES and QQQ ride the existing batched macro quote call (one extra symbol each,
 # negligible cost) so % change + ES Level-1 refresh on the 30s macro cadence.
-MACRO_SYMBOLS: tuple[str, ...] = ("/CL", "/GC", "$VIX", ES_SYMBOL, QQQ_SYMBOL)
+# $VIX (30-day) stays for the macro board + premarket band; $VIX1D feeds vanna.
+MACRO_SYMBOLS: tuple[str, ...] = ("/CL", "/GC", "$VIX", VIX1D_SYMBOL, ES_SYMBOL, QQQ_SYMBOL)
 
 # ---------------------------------------------------------------------------
 # Engine tuning
@@ -141,15 +147,25 @@ class ThrottleConfig:
 
 @dataclass(frozen=True)
 class FlowConfig:
-    """Options-volume tracking and the vanna-rally detector."""
+    """Options-volume tracking and the vanna-rally detector (a primary trigger).
+
+    Driven by $VIX1D (1-day implied vol), not the 30-day $VIX — VIX1D reacts to the
+    intraday 0DTE vol crush the vanna rally is built on. The trade-off is VIX1D's
+    end-of-day distortion: its measurement window mechanically shrinks into the
+    close, so it ramps near 4:00 ET for structural reasons, not real vol. The vanna
+    trigger is suppressed inside that window (see vix1d_distort_* / VannaTracker)."""
     # VIX trend: compare the latest sample to one ~this many macro-samples ago.
     # macro_worker runs every 30s, so 6 samples ≈ 3 minutes.
     vix_lookback_samples: int = 6
-    vix_drop_pts: float = 0.30          # VIX must fall at least this over lookback
+    vix_drop_pts: float = 0.30          # VIX1D must fall at least this over lookback
     # Fresh OTM-call contracts (interval delta) needed before flow "counts".
     min_call_flow: float = 2000.0
     # OTM call flow must outpace OTM put flow by this multiple to be vanna-active.
     call_dominance_ratio: float = 1.5
+    # VIX1D end-of-day distortion window (ET): from this time to the close, the vanna
+    # trigger is suppressed so the mechanical late-day ramp isn't read as signal.
+    vix1d_distort_hour: int = 15
+    vix1d_distort_minute: int = 45
 
 
 @dataclass(frozen=True)
@@ -174,8 +190,9 @@ class ScalpConfig:
     chop_window_min: int = 5
     chop_max_crosses: int = 3
     # Room to the nearest structural target in the trade direction (index points).
-    # Mirrors the analyst's ~8pt overhead-magnet HARD RULE: no room, no trade.
-    min_room_pts: float = 8.0
+    # Lowered from 8 → 4 so smaller "base hit" momentum scalps aren't dropped; the
+    # analyst's overhead-magnet rule is relaxed to ~4pt for momentum edges to match.
+    min_room_pts: float = 4.0
     # Contract bid/ask spread ceiling as a fraction of mid — wider = untradeable.
     max_spread_pct: float = 0.10
     # VIX move (over the vanna lookback) that makes a direction's premium a headwind:
@@ -210,7 +227,16 @@ class DisplacementConfig:
     sweep_lookback: int = 3             # bars before the move scanned for a sweep
     sweep_pierce_pts: float = 1.0       # how far beyond a level a sweep must pierce
     min_fvg_pts: float = 0.5            # minimum imbalance width to count as an FVG
-    require_sweep: bool = False         # promote the sweep from booster to hard gate
+    # The high-volume displacement CANDLE is the only hard gate; FVG, MSS, and the
+    # liquidity sweep are conviction boosters. Flip a require_* flag to harden that
+    # pillar back into the gate once its parameters are tuned.
+    require_fvg: bool = False
+    require_mss: bool = False
+    require_sweep: bool = False
+    # The 50%-of-range midpoint of the displacement candle: price holding at/above it
+    # (bullish thrust) = institutions defending longs → calls; a close back below it
+    # = they've flipped to sellers → puts (mirror for a bearish thrust).
+    mid_fraction: float = 0.5
 
 
 @dataclass(frozen=True)

@@ -39,17 +39,17 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    split ITM/OTM around spot) and runs the **vanna-rally tracker** (see below).
 4. `engine/scan2.py` keeps the rolling bar tape + key-level grid and runs
    `detect_candidate` — a cheap gate that only decides whether a bar is *worth a
-   Claude call*. It watches, highest-information first, leading with the **main
-   edges**: an **EMA ignition** (a gated 1m 5/9 cross / 5-EMA reclaim — a primary
-   momentum edge, see below), a **regime flip** (spot crossing the zero-gamma
-   pivot), a **displacement** (institutional thrust: candle + FVG + MSS), and the
-   power-hour **MOC plays** (see below); then, demoted beneath them, a **flow
-   confluence** — a bullish vanna rally or its bearish mirror **put-flow pressure**
-   (corroboration, no longer the headline trigger); then an **ORB breakout** (a
-   confirmed close beyond the locked opening range), a **liquidity sweep**, a
-   **level rejection** (probe-and-reverse at the *edge* of the session range —
-   the range-day reversal), a **range-expansion** thrust between levels (the
-   trend-day momentum signal), or a **level cross on volume**. The key-level grid
+   Claude call*. The power-hour **MOC plays** are checked first (window-gated), then
+   the strict precedence is: a **regime flip** (spot crossing the zero-gamma pivot —
+   the lead GEX edge), a **vanna / flow** trigger (a bullish vanna rally or its
+   bearish mirror **put-flow pressure** — a *primary, standalone* signal that fires
+   off the flow read regardless of any chart pattern), an **EMA ignition** (a gated
+   1m 5/9 cross / 5-EMA reclaim — see below), a **displacement** (a high-volume
+   institutional thrust candle — see below); then an **ORB breakout** (a confirmed
+   close beyond the locked opening range), a **liquidity sweep**, a **level
+   rejection** (probe-and-reverse at the *edge* of the session range — the range-day
+   reversal), a **range-expansion** thrust between levels (the trend-day momentum
+   signal), or a **level cross on volume**. The key-level grid
    includes the round-number grid, prior close, session high/low, **session
    VWAP**, **and the GEX walls + zero-gamma flip** so reactions fire at real
    structure, not just round numbers. Rejections only count near the running
@@ -67,21 +67,27 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    stay quiet.
 6. `output/embeds.py` renders the `Signal` to a color-coded Discord embed.
 
-## The vanna rally (a flow confluence)
+## The vanna rally (a primary trigger)
 
-When VIX falls, implied vol drops, so calls get cheaper — buyers pile into OTM
-calls. Dealers short those calls must buy the underlying to stay hedged (vanna),
-which mechanically lifts spot. `flow.py` watches for this: **VIX falling** while
-fresh **OTM call flow outpaces OTM put flow**. It used to be Helenus's headline
-edge; it's now read as a **confluence** that corroborates a setup — the main edges
-(the EMA-ignition scalp, the regime flip, displacement, the MOC plays) lead, and
-flow confirms or fades them. It's still most potent as a *reversal* tell — a
-hard-falling tape where VIX rolls over and call flow turns is strong confirmation
-for a long when a primary setup lines up — but it no longer carries an alert on
-its own. `!flow` posts the options-volume summary (call/put volume split
-ITM/OTM, above vs below spot) plus the live vanna read; a vanna-driven alert
-attaches it automatically. Tunable in `FlowConfig` (`vix_drop_pts`,
-`min_call_flow`, `call_dominance_ratio`).
+When 1-day implied vol falls, calls get cheaper — buyers pile into OTM calls.
+Dealers short those calls must buy the underlying to stay hedged (vanna), which
+mechanically lifts spot. `flow.py` watches for this: **VIX1D falling** while fresh
+**OTM call flow outpaces OTM put flow** (the bearish mirror, **put-flow pressure**,
+is VIX1D rising + OTM put flow → dealer selling). It's a **primary, standalone
+trigger** — an extreme flow skew with VIX1D moving fires on its own, ranked just
+under the GEX regime flip, regardless of any chart pattern. It's most potent as a
+*reversal*: a hard-falling tape where VIX1D rolls over and call flow turns is a
+high-conviction long.
+
+**Driven by `$VIX1D`, not the 30-day `$VIX`** — VIX1D measures 0DTE implied vol, so
+it reacts to the intraday vol crush the rally is built on. The catch is VIX1D's
+end-of-day distortion: its measurement window mechanically shrinks into the close,
+so it ramps near 4:00 ET for structural reasons, not real vol — the vanna trigger
+is therefore **suppressed inside the late-day window** (`FlowConfig.vix1d_distort_*`).
+`!flow` posts the options-volume summary (call/put volume split ITM/OTM, above vs
+below spot) plus the live vanna read; a vanna-driven alert attaches it
+automatically. Tunable in `FlowConfig` (`vix_drop_pts`, `min_call_flow`,
+`call_dominance_ratio`).
 
 ## Charm — the afternoon melt-up (delta decay)
 
@@ -125,17 +131,20 @@ tape. So the cross is the *trigger, not the edge — the edge is the filtering*,
 `engine/scalp.py` wraps it in a gated stack that is exactly what makes this a
 primary setup rather than a noisy scalp:
 
-- **Regime (Gate 0).** Momentum only in negative/transition GEX (green); stand
-  down in high-positive GEX (red — dealers fade every push).
+- **Regime (Gate 0 — advisory, not a block).** Negative/transition GEX (green) is
+  the friendly tape; high-positive GEX (red) **still fires** but is flagged
+  `slow_grind` (dealer-damped) so the analyst tempers targets and conviction rather
+  than the cross being auto-suppressed.
 - **Vanna headwind (Gate 1).** Falling IV bleeds vega out of a long option's
-  premium, so a strongly falling VIX is a premium headwind (the logged "calls
+  premium, so a strongly falling VIX1D is a premium headwind (the logged "calls
   drag, puts carry" asymmetry) — distinct from the vanna *rally* (a spot signal).
 - **SPX confirmation (Gate 2).** SPX itself must confirm — price on the trade-side
   of session VWAP (falls back to the structural trend before VWAP is warm).
 - **De-noising (Gate 3).** A **chop counter** (N+ 5/9 crosses in a tight window =
-  chop), a **room-to-target** floor (≥8pt, matching the analyst's magnet rule), an
-  acceptable **contract spread**, and a **dual-bleed** avoidance flag (both ATM
-  wings bleeding = a GEX-pinned chop signature).
+  chop), a **room-to-target** floor (**≥4pt** — lowered from 8 so smaller base hits
+  aren't dropped; the analyst relaxes its magnet rule to ~4pt for the momentum edges
+  to match), an acceptable **contract spread**, and a **dual-bleed** avoidance flag
+  (both ATM wings bleeding = a GEX-pinned chop signature).
 
 EMAs run on the clean continuous SPX **index** tape (`MarketState`); the selected
 contract's **premium** is tracked separately for two boosters — the
@@ -152,26 +161,25 @@ which need per-contract volume/wick candles off a streaming feed.)
 ## Displacement — the institutional thrust
 
 A displacement is the footprint of one-sided "smart money" flow: a sudden,
-aggressive, full-bodied candle on heavy volume. A big candle alone isn't a
-signal, so `engine/displacement.py` requires three structural pillars before it
-fires:
+aggressive, full-bodied candle on heavy volume. The **hard gate is the candle
+itself** — body ≥ an ATR multiple, mostly body (small wicks), on volume well above
+the 20-bar baseline. The structural pillars are now conviction **boosters**, not
+requirements (each has a `require_*` flag to harden it back into the gate):
 
-- **Displacement candle** — body ≥ an ATR multiple, mostly body (small wicks),
-  on volume well above the 20-bar baseline.
 - **Market structure shift (MSS)** — the thrust *closes past a recent swing*
   high/low, proof the trend actually turned rather than just wicking.
-- **Fair value gap (FVG)** — the move is so fast the other side can't keep up,
-  leaving a 3-candle imbalance (candle 1 and candle 3 wicks don't overlap). That
-  gap is a high-quality **retrace-entry zone**, not a chase.
+- **Fair value gap (FVG)** — a 3-candle imbalance (candle 1 and candle 3 wicks
+  don't overlap), a high-quality **retrace-entry zone**, not a chase.
+- **Liquidity sweep** — the move began by running stops beyond a prior swing then
+  reversing (the trap).
 
-Per the design, the **candle + FVG + MSS are the hard gate** (all crisply
-computable from the tape); the fourth pillar, the **liquidity sweep** (the move
-began by running stops beyond a prior swing then reversing — the trap), is
-detected and surfaced as a strong conviction *booster*, with a `require_sweep`
-flag to harden it once tuned. The reading is pure/stateless. Claude weighs the
-FVG retrace zone and the sweep, and flags chase-risk when price has already
-extended far past the gap toward an opposing magnet. `!disp` posts the board.
-Tunable in `DisplacementConfig`.
+It also reads the candle's **50% midpoint trend**: institutions defend the half-way
+mark of their displacement, so price **holding ≥ 50%** of a bullish thrust = an
+uptrend (look for **calls**), while a **close back below 50%** = they've flipped to
+sellers (look for **puts**) — mirror for a bearish thrust. That `trend_direction`
+is the freshest read of who's in control and leads Claude's directional call. The
+reading is pure/stateless. `!disp` posts the board. Tunable in `DisplacementConfig`
+(`require_fvg` / `require_mss` / `require_sweep`, `mid_fraction`).
 
 ## ORB — the opening range breakout
 

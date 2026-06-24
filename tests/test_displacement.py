@@ -6,9 +6,10 @@ No network, no Schwab key. Runs under pytest *or* standalone:
     pytest tests/test_displacement.py
     python tests/test_displacement.py
 
-Asserts the structural contract: the displacement candle (big body / small wicks
-/ high volume), the fair value gap (1st & 3rd wicks don't overlap), the market
-structure shift (close past a recent swing), and the liquidity-sweep booster.
+Asserts the contract: the high-volume displacement candle (big body / small wicks)
+is the ONLY hard gate; the fair value gap, the market structure shift, and the
+liquidity sweep are conviction boosters; and the 50% midpoint confirms the trend
+(hold ≥50% → calls, close <50% → puts).
 """
 
 from __future__ import annotations
@@ -79,6 +80,10 @@ def test_bullish_displacement_is_active() -> None:
     assert r.body_frac >= 0.6 and r.vol_ratio >= 1.5
     assert r.fvg_low is not None and r.fvg_high is not None and r.fvg_high > r.fvg_low
     assert r.mss_level is not None
+    # 50% midpoint trend: the next bar holds above the candle midpoint → uptrend
+    # (institutions defending longs → look for calls).
+    assert r.midpoint is not None and r.holding_above_mid
+    assert r.trend_direction is Direction.BULLISH
 
 
 def test_bearish_displacement_is_active() -> None:
@@ -88,21 +93,31 @@ def test_bearish_displacement_is_active() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Each pillar is necessary
+# The candle is the only hard gate; FVG / MSS are boosters
 # --------------------------------------------------------------------------- #
 
-def test_no_fvg_when_wicks_overlap() -> None:
-    # c3 drops back so its low overlaps c1's high → no imbalance.
+def test_no_fvg_still_active_candle_only() -> None:
+    # c3 drops back so its low overlaps c1's high → no imbalance. FVG is a booster
+    # now, so the qualifying candle still fires.
     r = _read(_bars(c3=(5010, 5015, 4998, 5004, 3000)))
-    assert r.detected and not r.fvg
-    assert not r.active
+    assert r.detected and not r.fvg and r.active
 
 
-def test_no_mss_when_close_holds_inside_structure() -> None:
+def test_no_mss_still_active_candle_only() -> None:
     # Raise the consolidation high above the thrust's close → no structure break.
+    # MSS is a booster now; the candle still carries it.
     r = _read(_bars(swing_top=5015.0))
-    assert r.detected and not r.mss
-    assert not r.active
+    assert r.detected and not r.mss and r.active
+
+
+def test_midpoint_lost_flips_trend_to_bearish() -> None:
+    # A bullish thrust, but the next bar closes back below the candle's 50% mark →
+    # institutions flipped to sellers: trend reads BEARISH (look for puts). Still a
+    # valid (active) candle — only the directional read flips.
+    r = _read(_bars(c3=(5010, 5012, 5000, 5002, 3000)))
+    assert r.detected and r.direction is Direction.BULLISH
+    assert not r.holding_above_mid and r.trend_direction is Direction.BEARISH
+    assert r.active
 
 
 def test_small_body_is_not_a_displacement() -> None:

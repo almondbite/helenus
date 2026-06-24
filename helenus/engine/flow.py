@@ -1,10 +1,12 @@
 """
-Options-volume flow — the confluence layer.
+Options-volume flow — a primary trigger.
 
-Read as CONFLUENCE that corroborates a setup, not a standalone edge: the main
-edges are the momentum/structural setups (the EMA-ignition scalp, the regime flip,
-displacement, the MOC plays), and the vanna rally / put-flow read confirms or
-fades them. It is demoted beneath those in the candidate gate (engine/scan2.py).
+The vanna rally / put-flow read fires STANDALONE (independent of any chart
+pattern): an extreme OTM call/put flow skew with VIX1D dropping/rising is enough to
+spend a Claude call on its own. It ranks just under the GEX regime flip in the
+candidate gate (engine/scan2.py). Driven by $VIX1D (1-day implied vol), not the
+30-day $VIX, so it reacts to the intraday 0DTE vol crush — with the end-of-day
+caveat noted in VannaTracker.update.
 
 Two things live here, both 0DTE-only (the chain is already pinned to today):
 
@@ -12,11 +14,11 @@ Two things live here, both 0DTE-only (the chain is already pinned to today):
      ITM/OTM for calls and puts. This is the volume *distribution*: a snapshot.
 
   2. VannaTracker / VannaReading — the *flow*: how that distribution is changing
-     between chain polls, read against the VIX trend. A "vanna rally" is the
-     setup where VIX is falling (calls get cheaper) and fresh OTM call volume is
+     between chain polls, read against the VIX1D trend. A "vanna rally" is the
+     setup where VIX1D is falling (calls get cheaper) and fresh OTM call volume is
      outpacing OTM put volume — dealers short those calls hedge by buying the
      underlying, which lifts spot. It's most potent as a reversal when price is
-     weak: the tape is falling, then call flow + a VIX roll-over turns it.
+     weak: the tape is falling, then call flow + a VIX1D roll-over turns it.
 
 Convention (relative to spot):
     call ITM: strike <= spot      call OTM: strike >  spot
@@ -179,7 +181,16 @@ class VannaTracker:
     def __init__(self) -> None:
         self._prev: VolumeProfile | None = None
 
-    def update(self, profile: VolumeProfile, vix_history: list[float]) -> VannaReading:
+    def update(
+        self,
+        profile: VolumeProfile,
+        vix_history: list[float],
+        eod_distortion: bool = False,
+    ) -> VannaReading:
+        """`vix_history` is the $VIX1D series. `eod_distortion` is set by the caller
+        in the late-day window where VIX1D's measurement window mechanically shrinks
+        and ramps into the close — there the trigger is suppressed (the ramp is
+        structural, not a real vol move)."""
         cfg = CONFIG.flow
 
         # Flow = interval delta of cumulative volume. clamp at 0 so the daily
@@ -214,10 +225,29 @@ class VannaTracker:
             and otm_put_flow >= cfg.call_dominance_ratio * max(otm_call_flow, 1.0)
         )
 
+        # VIX1D ramps mechanically into the close (its window shrinks), so a drop/
+        # rise there isn't a real vol move — suppress the trigger in that window.
+        if eod_distortion:
+            active = bearish_active = False
+            return VannaReading(
+                vix_change=round(vix_change, 2),
+                vix_falling=vix_falling,
+                otm_call_flow=otm_call_flow,
+                otm_put_flow=otm_put_flow,
+                call_flow_dominance=dominance,
+                active=False,
+                bearish_active=False,
+                label="suppressed (VIX1D EOD distortion)",
+                note=(
+                    f"VIX1D {vix_change:+.2f} inside the close-window distortion — "
+                    "mechanical ramp, not signal; vanna trigger suppressed."
+                ),
+            )
+
         if active:
-            label = "VANNA RALLY BUILDING"
+            label = "VANNA MOMENTUM"
             note = (
-                f"VIX {vix_change:+.2f} (falling) with fresh OTM call flow "
+                f"VIX1D {vix_change:+.2f} (falling) with fresh OTM call flow "
                 f"{otm_call_flow:,.0f} vs put {otm_put_flow:,.0f} "
                 f"({otm_call_flow / max(otm_put_flow, 1.0):.1f}x) — cheaper calls "
                 "drawing buyers; dealer hedging supports spot."
@@ -225,7 +255,7 @@ class VannaTracker:
         elif bearish_active:
             label = "PUT FLOW PRESSURE"
             note = (
-                f"VIX {vix_change:+.2f} (rising) with fresh OTM put flow "
+                f"VIX1D {vix_change:+.2f} (rising) with fresh OTM put flow "
                 f"{otm_put_flow:,.0f} vs call {otm_call_flow:,.0f} "
                 f"({otm_put_flow / max(otm_call_flow, 1.0):.1f}x) — put demand; "
                 "dealer hedging pressures spot lower."
@@ -233,18 +263,18 @@ class VannaTracker:
         elif vix_falling and dominance > 0:
             label = "vanna leaning bullish"
             note = (
-                f"VIX {vix_change:+.2f}, OTM call flow leading puts "
+                f"VIX1D {vix_change:+.2f}, OTM call flow leading puts "
                 f"({otm_call_flow:,.0f} vs {otm_put_flow:,.0f}) but below trigger."
             )
         elif vix_rising and dominance < 0:
             label = "leaning bearish"
             note = (
-                f"VIX {vix_change:+.2f}, OTM put flow leading calls "
+                f"VIX1D {vix_change:+.2f}, OTM put flow leading calls "
                 f"({otm_put_flow:,.0f} vs {otm_call_flow:,.0f}) but below trigger."
             )
         else:
             label = "no flow setup"
-            note = f"VIX {vix_change:+.2f}; OTM call flow {otm_call_flow:,.0f} vs put {otm_put_flow:,.0f}."
+            note = f"VIX1D {vix_change:+.2f}; OTM call flow {otm_call_flow:,.0f} vs put {otm_put_flow:,.0f}."
 
         return VannaReading(
             vix_change=round(vix_change, 2),

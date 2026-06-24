@@ -45,7 +45,7 @@ _T0 = dt.datetime(2026, 6, 22, 13, 0, tzinfo=ET)
 
 # Decline (top 5012) then a rising run; the 5/9 cross lands on the FINAL bar at
 # close 5001 — session high stays 11pt away and the nearest round number (5010)
-# sits 9pt above, so the room gate (≥8pt) passes.
+# sits 9pt above, so the room gate (≥4pt) passes.
 _CROSS_UP_CLOSES = list(range(5012, 4994, -1)) + list(range(4996, 5002))
 
 
@@ -248,11 +248,13 @@ def test_active_when_all_gates_pass() -> None:
     assert r.target_contract is not None and r.premium_target is not None
 
 
-def test_gated_in_positive_gamma_regime() -> None:
+def test_positive_gamma_is_slow_grind_not_blocked() -> None:
+    # Gate 0 is no longer a hard block: high-positive GEX still fires, just flagged
+    # `slow_grind` for the analyst to temper (rather than suppressed).
     _, _, r = _run(_CROSS_UP_CLOSES, _red_gex(), _vanna(0.0), chain=_chain())
     assert r.direction is Direction.BULLISH
-    assert not r.regime_ok
-    assert not r.active
+    assert not r.regime_ok and r.slow_grind
+    assert r.active
 
 
 def test_gated_on_vanna_headwind() -> None:
@@ -281,11 +283,11 @@ def test_gated_in_chop() -> None:
 
 
 def test_gated_on_insufficient_room() -> None:
-    # Shift the whole path up 1pt so the final close lands at 5002 → the nearest
-    # round number (5010) is only 8pt... use 5003 to drop room below the floor.
-    closes = [c + 2 for c in _CROSS_UP_CLOSES]   # final close 5003 → 5010 is 7pt
-    _, _, r = _run(closes, _green_gex(spot=5003.0), _vanna(0.0),
-                   chain=_chain(spot=5003.0))
+    # Shift the whole path up so the final close lands at 5007 → the nearest round
+    # number (5010) is only 3pt, below the lowered 4pt room floor.
+    closes = [c + 6 for c in _CROSS_UP_CLOSES]   # final close 5007 → 5010 is 3pt
+    _, _, r = _run(closes, _green_gex(spot=5007.0), _vanna(0.0),
+                   chain=_chain(spot=5007.0))
     assert r.room_to_level_pts < CONFIG.scalp.min_room_pts
     assert not r.room_ok and not r.active
 

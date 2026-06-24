@@ -118,7 +118,19 @@ def test_vanna_trips_on_falling_vix_and_call_flow() -> None:
     assert _approx(reading.otm_put_flow, 300)
     assert reading.vix_falling is True
     assert reading.active is True
-    assert "VANNA RALLY" in reading.label.upper()
+    assert "VANNA MOMENTUM" in reading.label.upper()
+
+
+def test_vanna_suppressed_in_eod_distortion() -> None:
+    # The exact setup that trips active, but inside the VIX1D close-window
+    # distortion — the mechanical late-day ramp must NOT fire the trigger.
+    tracker = VannaTracker()
+    tracker.update(build_volume_profile(_PREV), _VIX_FALLING)
+    reading = tracker.update(
+        build_volume_profile(_CURR), _VIX_FALLING, eod_distortion=True
+    )
+    assert reading.active is False and reading.bearish_active is False
+    assert "suppress" in reading.note.lower()
 
 
 def test_vanna_quiet_when_vix_not_falling() -> None:
