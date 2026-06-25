@@ -51,12 +51,14 @@ class OpenAlert:
     high: float = field(init=False)
     low: float = field(init=False)
     last: float = field(init=False)
+    early_mae: float = field(init=False)    # adverse excursion within the first N bars
     bars: int = 0
 
     def __post_init__(self) -> None:
         self.high = self.entry
         self.low = self.entry
         self.last = self.entry
+        self.early_mae = 0.0
 
 
 @dataclass(frozen=True)
@@ -69,10 +71,16 @@ class Outcome:
     mfe_mae_ratio: float
     net_pts: float                  # signed in the alert's favor (+ = good)
     grade: str                      # ACCURATE | MIXED | INACCURATE
+    # Earliness metrics (reported, not part of the grade): the adverse excursion in
+    # the FIRST few bars, and whether it tripped the immediate-reversal threshold —
+    # the "fired then reversed" failure earliness is meant to drive DOWN.
+    early_mae_pts: float = 0.0
+    early_reversal: bool = False
 
 
 def grade_excursion(
-    direction: str, entry: float, high: float, low: float, last: float, bars: int
+    direction: str, entry: float, high: float, low: float, last: float, bars: int,
+    early_mae: float = 0.0,
 ) -> Outcome:
     """
     Pure MFE/MAE grade. Favorable is up for BULLISH, down for BEARISH.
@@ -114,6 +122,8 @@ def grade_excursion(
         mfe_mae_ratio=round(ratio, 2),
         net_pts=round(net, 2),
         grade=grade,
+        early_mae_pts=round(early_mae, 2),
+        early_reversal=early_mae >= cfg.early_reversal_pts,
     )
 
 
@@ -124,8 +134,9 @@ def grade_excursion(
 class OutcomeTracker:
     """Rolls MFE/MAE for open alerts and matures them after the forward window."""
 
-    def __init__(self, window: int | None = None) -> None:
+    def __init__(self, window: int | None = None, early_window: int | None = None) -> None:
         self.window = window or CONFIG.feedback.forward_window_bars
+        self.early_window = early_window or CONFIG.feedback.early_window_bars
         self._open: dict[str, OpenAlert] = {}
 
     def track(self, alert: OpenAlert) -> None:
@@ -143,10 +154,19 @@ class OutcomeTracker:
             alert.low = min(alert.low, spot)
             alert.last = spot
             alert.bars += 1
+            # Freeze the immediate-reversal read after the first N bars: the adverse
+            # excursion so far (high/low are monotonic since entry, so this is the
+            # worst adverse move within the early window).
+            if alert.bars <= self.early_window:
+                adverse = (
+                    alert.entry - alert.low if alert.direction == "BULLISH"
+                    else alert.high - alert.entry
+                )
+                alert.early_mae = max(alert.early_mae, max(0.0, adverse))
             if alert.bars >= self.window:
                 outcome = grade_excursion(
                     alert.direction, alert.entry, alert.high, alert.low,
-                    alert.last, alert.bars,
+                    alert.last, alert.bars, early_mae=alert.early_mae,
                 )
                 matured.append((alert, outcome))
                 del self._open[alert.id]
@@ -206,6 +226,8 @@ class Journal:
             "mfe_mae_ratio": outcome.mfe_mae_ratio,
             "net_pts": outcome.net_pts,
             "grade": outcome.grade,
+            "early_mae_pts": outcome.early_mae_pts,
+            "early_reversal": outcome.early_reversal,
         }
         if claude_note:
             rec["claude_note"] = claude_note
@@ -261,6 +283,9 @@ class Journal:
                     "mae_pts": r["mae_pts"],
                     "mfe_mae_ratio": r["mfe_mae_ratio"],
                     "net_pts": r["net_pts"],
+                    # Earliness metrics — absent on pre-existing records (default 0/False).
+                    "early_mae_pts": r.get("early_mae_pts", 0.0),
+                    "early_reversal": r.get("early_reversal", False),
                 }
             )
         return graded
@@ -278,11 +303,14 @@ class Journal:
         grades = [g["grade"] for g in graded]
         by_trigger: dict[str, dict[str, int]] = {}
         for g in graded:
-            t = by_trigger.setdefault(g["trigger"], {"n": 0, "ACCURATE": 0})
+            t = by_trigger.setdefault(g["trigger"], {"n": 0, "ACCURATE": 0, "early_reversal": 0})
             t["n"] += 1
             if g["grade"] == "ACCURATE":
                 t["ACCURATE"] += 1
+            if g.get("early_reversal"):
+                t["early_reversal"] += 1
 
+        early_reversals = sum(1 for g in graded if g.get("early_reversal"))
         return {
             "count": n,
             "accurate": grades.count("ACCURATE"),
@@ -292,6 +320,10 @@ class Journal:
             "avg_mfe_pts": avg("mfe_pts"),
             "avg_mae_pts": avg("mae_pts"),
             "avg_ratio": avg("mfe_mae_ratio"),
+            # Earliness scorecard: the immediate-reversal rate (drive DOWN) and the
+            # avg first-N-bar adverse excursion, alongside MFE-from-entry (avg_mfe_pts).
+            "early_reversal_rate": round(early_reversals / n * 100, 1),
+            "avg_early_mae_pts": avg("early_mae_pts"),
             "by_trigger": by_trigger,
         }
 

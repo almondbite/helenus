@@ -22,7 +22,7 @@ from helenus.engine.scalp import ScalpReading
 from helenus.engine.displacement import DisplacementReading
 from helenus.engine.orb import ORBReading
 from helenus.engine.moc import MocReading
-from helenus.engine.scan2 import Direction, Signal, TriggerType
+from helenus.engine.scan2 import ApproachArm, Direction, Signal, TriggerType
 
 COLOR_BULL = discord.Color.from_rgb(46, 204, 113)
 COLOR_BEAR = discord.Color.from_rgb(231, 76, 60)
@@ -273,6 +273,43 @@ def signal_embed(
     if moc is not None and sig.trigger in (TriggerType.MOC_REVERSAL, TriggerType.CAPITULATION):
         _field(embed, "MOC", _moc_line(moc))
 
+    embed.set_footer(text=_footer())
+    return _fit(embed)
+
+
+def watch_embed(
+    arm: ApproachArm,
+    gex: GexProfile | None = None,
+    charm: CharmProfile | None = None,
+) -> discord.Embed:
+    """Stage-1 WATCH — a deliberately MUTED heads-up that price is approaching a
+    reaction zone with aligned context, distinct from an entry. Grey (no green/red
+    entry coloring), no trade plan: it's a watch, not a signal. The reactive trigger
+    is still the entry (and fires pre-armed)."""
+    arrow = "▲" if arm.direction is Direction.BULLISH else "▼"
+    embed = discord.Embed(
+        title=f"👀 WATCH — Approaching {arm.level.label} {arrow} {arm.direction.value}",
+        description=_clip(
+            f"• {arm.reason}\n"
+            "• _Heads-up, not an entry — waiting on the reactive trigger to confirm. "
+            "If it fires this way, it fires pre-armed._",
+            _DESC_MAX,
+        ),
+        color=COLOR_INFO,
+        timestamp=now_et(),
+    )
+    _field(embed, "Level", f"{arm.level.label} ({arm.level.price:.2f})", inline=True)
+    _field(embed, "Distance", f"{arm.distance_pts:.1f} pt", inline=True)
+    _field(embed, "Pre-load", f"+{arm.confidence_preload:.0f} on confirm", inline=True)
+    if gex is not None:
+        zg = f"{gex.zero_gamma:.0f}" if gex.zero_gamma is not None else "n/a"
+        _field(
+            embed,
+            "Gamma Context",
+            f"Regime: `{gex.regime}` | Zero-Γ: `{zg}` | Net: `{_fmt_gex(gex.total_net_gex)}`",
+        )
+    if charm is not None:
+        _field(embed, "Charm (delta-decay)", _charm_line(charm))
     embed.set_footer(text=_footer())
     return _fit(embed)
 
@@ -640,7 +677,9 @@ def review_embed(review: dict, stats: dict) -> discord.Embed:
             f"`{stats.get('inaccurate', 0)}`✗)\n"
             f"Avg MFE `{stats.get('avg_mfe_pts', 0)}` / "
             f"MAE `{stats.get('avg_mae_pts', 0)}` pts | "
-            f"ratio `{stats.get('avg_ratio', 0)}`"
+            f"ratio `{stats.get('avg_ratio', 0)}`\n"
+            f"Early-reversal rate **{stats.get('early_reversal_rate', 0)}%** "
+            f"(avg first-bars MAE `{stats.get('avg_early_mae_pts', 0)}` pts)"
         ),
     )
 

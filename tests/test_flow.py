@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 
+from helenus.config import FlowConfig
 from helenus.engine.flow import VannaTracker, build_volume_profile
 
 
@@ -182,6 +183,59 @@ def test_put_flow_quiet_when_vix_not_rising() -> None:
     tracker.update(build_volume_profile(prev), _VIX_FALLING)
     reading = tracker.update(build_volume_profile(curr), _VIX_FALLING)
     assert reading.bearish_active is False          # put flow there, VIX isn't
+
+
+# --------------------------------------------------------------------------- #
+# Flow INFLECTION — the early arm (the derivative, not the level)
+# --------------------------------------------------------------------------- #
+
+def _vp(call_cum: float, put_cum: float, spot: float = 5000.0):
+    # OTM call strike (5040 > spot) and OTM put strike (4960 < spot).
+    return build_volume_profile(
+        _chain(spot, calls=[(5040.0, call_cum)], puts=[(4960.0, put_cum)])
+    )
+
+
+def _warm_calls(tr: VannaTracker, vix: list[float]) -> None:
+    # Three low-flow priors so the acceleration baseline exists (have_base).
+    for cc in (1000.0, 1200.0, 1400.0):
+        tr.update(_vp(cc, 500.0), vix)
+
+
+def test_flow_inflection_arms_early() -> None:
+    # VIX1D slope rolling over + OTM-call flow accelerating, BUT flow still below the
+    # level trigger's min_call_flow → the early arm fires before the level trigger.
+    tr = VannaTracker(FlowConfig(inflection_enabled=True))
+    _warm_calls(tr, [15.0, 15.0, 15.0, 15.0, 15.0])
+    r = tr.update(_vp(2900.0, 520.0), [15.0, 15.0, 15.0, 14.8, 14.5])   # flow +1500
+    assert r.inflection_active is True
+    assert r.active is False                # 1500 < min_call_flow (2000)
+    assert r.inflection_bearish is False
+
+
+def test_flow_inflection_disabled_by_default() -> None:
+    tr = VannaTracker(FlowConfig(inflection_enabled=False))
+    _warm_calls(tr, [15.0, 15.0, 15.0, 15.0, 15.0])
+    r = tr.update(_vp(2900.0, 520.0), [15.0, 15.0, 15.0, 14.8, 14.5])
+    assert r.inflection_active is False     # same data, gated off
+
+
+def test_flow_inflection_needs_a_vix_turn() -> None:
+    tr = VannaTracker(FlowConfig(inflection_enabled=True))
+    flat = [15.0, 15.0, 15.0, 15.0, 15.0]
+    _warm_calls(tr, flat)
+    r = tr.update(_vp(2900.0, 520.0), flat)   # flow accelerates but VIX1D is flat
+    assert r.inflection_active is False
+
+
+def test_flow_inflection_bearish_mirror() -> None:
+    tr = VannaTracker(FlowConfig(inflection_enabled=True))
+    for pc in (1000.0, 1200.0, 1400.0):
+        tr.update(_vp(500.0, pc), [13.0, 13.0, 13.0, 13.0, 13.0])
+    r = tr.update(_vp(520.0, 2900.0), [13.0, 13.0, 13.0, 13.2, 13.5])   # put flow +1500
+    assert r.inflection_bearish is True
+    assert r.bearish_active is False
+    assert r.inflection_active is False
 
 
 # --------------------------------------------------------------------------- #

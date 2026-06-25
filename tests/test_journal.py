@@ -163,7 +163,7 @@ def test_journal_roundtrip_and_stats() -> None:
         assert s["accurate"] == 1
         assert s["inaccurate"] == 1
         assert s["accuracy_pct"] == 50.0
-        assert s["by_trigger"]["Vanna Rally"] == {"n": 2, "ACCURATE": 1}
+        assert s["by_trigger"]["Vanna Rally"] == {"n": 2, "ACCURATE": 1, "early_reversal": 0}
 
 
 def test_stats_empty() -> None:
@@ -171,6 +171,51 @@ def test_stats_empty() -> None:
         j = Journal(path=os.path.join(d, "empty.jsonl"))
         assert j.stats() == {"count": 0}
         assert j.graded_alerts() == []
+
+
+# --------------------------------------------------------------------------- #
+# Earliness metrics — immediate-reversal rate + first-N-bar adverse excursion
+# --------------------------------------------------------------------------- #
+
+def test_early_reversal_flagged_on_large_first_bar_adverse() -> None:
+    # Strong eventual MFE, but a big adverse move in the first N bars → flagged
+    # (the "fired then reversed" earliness failure). The grade itself is unchanged.
+    o = grade_excursion("BULLISH", 5000, 5012, 4998, 5010, 30, early_mae=4.0)
+    assert o.early_mae_pts == 4.0
+    assert o.early_reversal is True            # 4.0 >= early_reversal_pts (3.0)
+    assert o.grade == "ACCURATE"               # grade buckets untouched
+
+
+def test_no_early_reversal_when_first_bars_are_clean() -> None:
+    o = grade_excursion("BULLISH", 5000, 5012, 4998, 5010, 30, early_mae=1.0)
+    assert o.early_reversal is False
+
+
+def test_early_mae_freezes_after_the_early_window() -> None:
+    tracker = OutcomeTracker(window=6, early_window=2)
+    tracker.track(_alert("BULLISH"))           # entry 5000
+    tracker.update(4996)                        # bar1: adverse 4 → early_mae 4
+    tracker.update(5000)                        # bar2: still within window, adverse 0
+    tracker.update(4990)                        # bar3: beyond window — must NOT update
+    tracker.update(5001)
+    tracker.update(5002)
+    matured = tracker.update(5003)              # bar6 → matures
+    _alert_obj, outcome = matured[0]
+    assert outcome.early_mae_pts == 4.0         # frozen at the first-2-bar adverse
+    assert outcome.mae_pts == 10.0              # full-window MAE still sees the 4990 low
+    assert outcome.early_reversal is True
+
+
+def test_stats_reports_early_reversal_rate() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        j = Journal(path=os.path.join(d, "j.jsonl"))
+        a1 = _alert(); j.log_alert(a1)
+        j.log_outcome(a1.id, grade_excursion("BULLISH", 5000, 5012, 4998, 5010, 30, early_mae=5.0))
+        a2 = _alert(); j.log_alert(a2)
+        j.log_outcome(a2.id, grade_excursion("BULLISH", 5000, 5012, 4998, 5010, 30, early_mae=0.0))
+        s = j.stats()
+        assert s["early_reversal_rate"] == 50.0
+        assert "avg_early_mae_pts" in s
 
 
 # --------------------------------------------------------------------------- #

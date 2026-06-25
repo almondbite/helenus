@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from helenus.engine.displacement import DisplacementReading
     from helenus.engine.orb import ORBReading
     from helenus.engine.moc import MocReading
+    from helenus.engine.cumdelta import CumDeltaReading
 
 
 class Direction(Enum):
@@ -64,6 +65,9 @@ class TriggerType(Enum):
     PREMARKET_SETUP = "Pre-Market Setup"
     VANNA_RALLY = "Vanna Momentum"
     PUT_FLOW = "Put Flow Pressure"
+    FLOW_INFLECTION = "Flow Inflection"
+    CD_REVERSAL = "CD Divergence"
+    ES_LEAD = "ES-Led Momentum"
     EMA_IGNITION = "EMA Ignition"
     DISPLACEMENT = "Displacement"
     ORB_BREAKOUT = "ORB Breakout"
@@ -109,6 +113,35 @@ class Candidate:
     trigger: TriggerType
     level: KeyLevel | None
     reason: str                 # human-readable description of what tripped
+
+
+@dataclass(frozen=True)
+class ApproachArm:
+    """Stage 1 of the two-stage anticipatory signal: price is APPROACHING a key
+    reaction zone with aligned structural context, BEFORE the reactive trigger
+    fires. Surfaced as a low-confidence WATCH (a heads-up, not an entry); when the
+    existing reactive trigger later fires aligned with a live arm, the entry's
+    confidence is pre-loaded from it. See detect_approach()."""
+    direction: Direction        # the reaction the context favors
+    level: KeyLevel             # the zone being approached
+    distance_pts: float         # how far spot is from the level
+    confidence_preload: float   # bounded points to add to an aligned entry
+    reason: str
+
+    def preload(self, direction: Direction, confidence: float) -> tuple[float, str | None]:
+        """Apply the pre-load to an entry's confidence when the arm is aligned with
+        the verdict direction. Pure — returns (new_confidence, note|None). A
+        misaligned (or zero-preload) arm leaves confidence untouched."""
+        if direction != self.direction or self.confidence_preload <= 0:
+            return confidence, None
+        new = min(confidence + self.confidence_preload, 95.0)
+        if new <= confidence:
+            return confidence, None
+        note = (
+            f"Pre-armed {self.direction.value} {self.level.label} @ {self.level.price:.2f}: "
+            f"{self.reason} — confidence {confidence:.0f} → {new:.0f}"
+        )
+        return new, note
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +338,8 @@ def detect_candidate(
     displacement: "DisplacementReading | None" = None,
     orb: "ORBReading | None" = None,
     moc: "MocReading | None" = None,
+    cumdelta: "CumDeltaReading | None" = None,
+    es_arm: Direction | None = None,
 ) -> Candidate | None:
     """
     Cheap attention gate: is the latest bar interesting enough to spend a Claude
@@ -395,6 +430,42 @@ def detect_candidate(
         return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
     if vanna is not None and vanna.bearish_active:
         return Candidate(trigger=TriggerType.PUT_FLOW, level=None, reason=vanna.note)
+
+    # --- Flow inflection: the EARLY arm (the derivative, not the level) --- #
+    # Ranked just under the full vanna/put-flow level triggers above (those are the
+    # confirm/fallback): the OTM-flow rate is accelerating and the VIX1D slope is
+    # rolling over BEFORE the absolute thresholds trip. Gated in the tracker
+    # (fields are False unless FlowConfig.inflection_enabled), so the poll-only
+    # path is unchanged.
+    if vanna is not None and (vanna.inflection_active or vanna.inflection_bearish):
+        return Candidate(trigger=TriggerType.FLOW_INFLECTION, level=None, reason=vanna.note)
+
+    # --- CD divergence: a LEADING reversal arm (ranked ahead of the lagging
+    #     reactive triggers, per the earliness principle) ------------------ #
+    # Cumulative delta on /ES diverged from price AT a session extreme: the move
+    # is being absorbed and is spent before price reverses. This is the early,
+    # anticipatory entry the confirmation triggers below cannot produce. Gated to
+    # the structural level (within arm_edge_pts of the matching session extreme,
+    # reusing edge-proximity semantics) so interior absorption doesn't arm.
+    if cumdelta is not None and cumdelta.arm_direction is not None:
+        edge = CONFIG.cumdelta.arm_edge_pts
+        arm = cumdelta.arm_direction
+        at_low = (
+            np.isfinite(state.session_low)
+            and (cur.close - state.session_low) <= edge
+        )
+        at_high = (
+            np.isfinite(state.session_high)
+            and (state.session_high - cur.close) <= edge
+        )
+        if (arm is Direction.BULLISH and at_low) or (arm is Direction.BEARISH and at_high):
+            extreme = state.session_low if arm is Direction.BULLISH else state.session_high
+            label = "Session Low" if arm is Direction.BULLISH else "Session High"
+            return Candidate(
+                trigger=TriggerType.CD_REVERSAL,
+                level=KeyLevel(float(extreme), label, 0.85),
+                reason=cumdelta.note,
+            )
 
     # --- EMA ignition: the gated 1m 5/9 contract scalp (a MAIN EDGE) ----- #
     # The 1m 5/9 momentum scalp. The scalp engine already ran its confirmation
@@ -530,6 +601,26 @@ def detect_candidate(
                     f"({side}); closed {cur.close:.2f}",
                 )
 
+    # --- ES-led momentum: ARM on /ES, CONFIRM on SPX --------------------- #
+    # The streamed /ES (futures, real-time) already thrust in a direction (the bot
+    # passes that arm); the SPX tape is ~15s stale, so the moment the SPX bar starts
+    # confirming the same direction we fire — up to one bar before the SPX-only
+    # range expansion below would. The substance is the (mature) /ES break plus cash
+    # confirmation; it's re-timing, not a loosened SPX threshold. Behind the stream
+    # staleness gate (es_arm is None when /ES is stale/disabled → poll path unchanged).
+    if es_arm is not None:
+        move = cur.close - prev.close
+        confirm_min = CONFIG.es_lead.confirm_min_pts
+        confirmed_up = es_arm is Direction.BULLISH and move >= confirm_min
+        confirmed_dn = es_arm is Direction.BEARISH and -move >= confirm_min
+        if confirmed_up or confirmed_dn:
+            d = "up" if confirmed_up else "down"
+            return Candidate(
+                trigger=TriggerType.ES_LEAD,
+                level=None,
+                reason=f"/ES led {d} (futures real-time); SPX confirming {move:+.1f}pt this bar",
+            )
+
     # --- Range expansion / momentum thrust ------------------------------- #
     # A directional push that the level-based triggers miss because it happens
     # between levels — the trend-day signal. Net displacement over the lookback
@@ -565,3 +656,121 @@ def detect_candidate(
                 )
 
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Approach / arm detector — stage 1 of the anticipatory two-stage signal
+# --------------------------------------------------------------------------- #
+
+def detect_approach(
+    state: MarketState,
+    gex: GexProfile | None,
+    charm: CharmProfile | None = None,
+    vanna: "VannaReading | None" = None,
+    cumdelta: "CumDeltaReading | None" = None,
+) -> ApproachArm | None:
+    """Anticipatory WATCH: is price APPROACHING a high-probability reaction zone
+    with the structural context already favoring a reaction in that direction —
+    *before* a reactive trigger could fire? Pure; reuses the key-level grid, the
+    edge-proximity gate, and the trend read.
+
+    Conditions:
+      * proximity — spot within `approach_pts` of a weighty reaction level (GEX
+        wall, zero-Γ, charm wall, session extreme — the existing grid, filtered to
+        `rejection_min_weight`),
+      * heading — the bar is moving TOWARD the level and the trend doesn't oppose
+        the approach,
+      * edge gate — for support/resistance reactions the level must sit near the
+        running session extreme (reuses `edge_proximity_pts`), so an interior wall
+        price merely pins never arms; the zero-Γ pivot is exempt (it's a flip, not
+        an edge),
+      * context — the reaction direction must be backed by structure (supportive/
+        overhead charm at intensity, gamma regime, an aligned CD absorption read,
+        active vanna); with `require_context` set, bare proximity never arms.
+
+    Returns the strongest arm (most context legs, then nearest), or None.
+    """
+    cfg = CONFIG.approach
+    if gex is None or len(state.bars) < 2:
+        return None
+    cur = state.bars[-1]
+    prev = state.bars[-2]
+    spot = cur.close
+    heading_up = cur.close > prev.close
+    heading_dn = cur.close < prev.close
+    if not (heading_up or heading_dn):
+        return None
+
+    trend = state.trend_direction()
+    approach = cfg.approach_pts
+    edge = CONFIG.scan.edge_proximity_pts
+    prior = list(state.bars)[:-1]
+    prior_low = min(b.low for b in prior)
+    prior_high = max(b.high for b in prior)
+    pos_gamma = gex.regime.startswith("POSITIVE")
+
+    best: tuple[tuple[int, float], ApproachArm] | None = None
+    for lv in state.key_levels(spot, gex, charm):
+        if lv.weight < CONFIG.scan.rejection_min_weight:
+            continue
+        dist = abs(lv.price - spot)
+        if dist <= 0 or dist > approach:
+            continue
+
+        legs: list[str] = []
+        if lv.label == "Zero-Γ":
+            # Regime-flip watch: trend-confirmed momentum into the pivot (exempt
+            # from the edge gate — the pivot is usually interior by nature).
+            direction = Direction.BULLISH if heading_up else Direction.BEARISH
+            if trend is None or trend != direction:
+                continue
+            legs.append(f"trend {direction.value.lower()} into the zero-Γ flip")
+            side = "pivot"
+        elif lv.price < spot and heading_dn and trend != Direction.BULLISH:
+            # Support approached from above → a bounce. Must be near the floor.
+            if (lv.price - prior_low) > edge:
+                continue
+            direction = Direction.BULLISH
+            side = "support"
+            if charm is not None and charm.bias == "SUPPORTIVE" and charm.intensity in ("HIGH", "BUILDING"):
+                legs.append(f"{charm.intensity.lower()} supportive charm")
+            if pos_gamma:
+                legs.append("positive gamma (mean-revert bounce)")
+            if cumdelta is not None and cumdelta.bullish_absorption:
+                legs.append("CD bullish absorption")
+            if vanna is not None and vanna.active:
+                legs.append("vanna active")
+        elif lv.price > spot and heading_up and trend != Direction.BEARISH:
+            # Resistance approached from below → a fade. Must be near the ceiling.
+            if (prior_high - lv.price) > edge:
+                continue
+            direction = Direction.BEARISH
+            side = "resistance"
+            if charm is not None and charm.bias == "OVERHEAD" and charm.intensity in ("HIGH", "BUILDING"):
+                legs.append(f"{charm.intensity.lower()} overhead charm")
+            if pos_gamma:
+                legs.append("positive gamma (fade into resistance)")
+            if cumdelta is not None and cumdelta.bearish_absorption:
+                legs.append("CD bearish absorption")
+            if vanna is not None and vanna.bearish_active:
+                legs.append("put-flow pressure")
+        else:
+            continue
+
+        if cfg.require_context and not legs:
+            continue
+        frac = min(1.0, len(legs) / 2.0)
+        preload = round(cfg.confidence_preload * frac, 1)
+        reason = (
+            f"Approaching {lv.label} @ {lv.price:.2f} ({dist:.1f}pt, {side}) "
+            f"{direction.value.lower()} — " + ("; ".join(legs) if legs else "proximity only")
+        )
+        arm = ApproachArm(
+            direction=direction, level=lv, distance_pts=round(dist, 2),
+            confidence_preload=preload, reason=reason,
+        )
+        key = (len(legs), -dist)
+        if best is None or key > best[0]:
+            best = (key, arm)
+
+    return best[1] if best is not None else None

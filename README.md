@@ -21,6 +21,8 @@ helenus/
   engine/orb.py         opening-range breakout: locked range + volume/VWAP gates
   engine/moc.py         market-on-close: premium-behavior reversal + capitulation
   engine/flow.py        0DTE call/put volume (ITM/OTM split) + vanna-rally tracker
+  engine/cumdelta.py    /ES cumulative-delta (executed-flow) exhaustion: veto + arm
+  engine/es_lead.py     /ES-leads-SPX micro-lead: arm on /ES break, confirm on SPX
   engine/scan2.py       pure rolling tape + key levels + candidate GATE (no verdict)
   engine/analyst.py     Claude reads the structured state -> Signal (the judgment)
   journal.py            MFE/MAE accuracy grading + append-only JSONL journal
@@ -43,13 +45,16 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    the strict precedence is: a **regime flip** (spot crossing the zero-gamma pivot —
    the lead GEX edge), a **vanna / flow** trigger (a bullish vanna rally or its
    bearish mirror **put-flow pressure** — a *primary, standalone* signal that fires
-   off the flow read regardless of any chart pattern), an **EMA ignition** (a gated
+   off the flow read regardless of any chart pattern), a **CD divergence** reversal
+   arm (cumulative-delta exhaustion on /ES at a session extreme — the leading
+   reversal read; see below), an **EMA ignition** (a gated
    1m 5/9 cross / 5-EMA reclaim — see below), a **displacement** (a high-volume
    institutional thrust candle — see below); then an **ORB breakout** (a confirmed
    close beyond the locked opening range), a **liquidity sweep**, a **level
    rejection** (probe-and-reverse at the *edge* of the session range — the range-day
-   reversal), a **range-expansion** thrust between levels (the trend-day momentum
-   signal), or a **level cross on volume**. The key-level grid
+   reversal), an **ES-led momentum** break (the streamed-/ES lead arming an early
+   entry the SPX bar then confirms — see below), a **range-expansion** thrust between
+   levels (the trend-day momentum signal), or a **level cross on volume**. The key-level grid
    includes the round-number grid, prior close, session high/low, **session
    VWAP**, **and the GEX walls + zero-gamma flip** so reactions fire at real
    structure, not just round numbers. Rejections only count near the running
@@ -88,6 +93,18 @@ is therefore **suppressed inside the late-day window** (`FlowConfig.vix1d_distor
 below spot) plus the live vanna read; a vanna-driven alert attaches it
 automatically. Tunable in `FlowConfig` (`vix_drop_pts`, `min_call_flow`,
 `call_dominance_ratio`).
+
+**Flow inflection — the early arm (the derivative, not the level).** The triggers
+above are *level* crossings: they fire only once VIX1D has already dropped
+`vix_drop_pts` and OTM call flow already exceeds `min_call_flow` — late by
+construction. The flow→hedge→spot chain is causally leading, so `VannaTracker` also
+reads the **derivative**: the *rate* of OTM call/put-flow accumulation accelerating
+(vs a rolling prior-interval baseline) **and** the **VIX1D slope** rolling over (the
+crush starting/steepening), before the absolute thresholds trip. That fires a
+separate, earlier `Flow Inflection` candidate, ranked just under the full vanna/
+put-flow level triggers — which stay as the confirm/fallback. **Flag-gated, default
+off** (`FlowConfig.inflection_enabled`); tunable via `inflection_accel_mult`,
+`inflection_min_flow`, `inflection_vix_slope`.
 
 ## Charm — the afternoon melt-up (delta decay)
 
@@ -256,7 +273,8 @@ Schwab actually streams that move the needle:
   place of poll-folded marks (same fields, so `on_bar` is source-agnostic).
 - **`level_one_futures`** on `/ES` → real-time bid/ask size + volume, mapped into
   the inner-quote shape `engine/intermarket.py` already reads (so the ES
-  microstructure refreshes on every tick instead of the 30s macro poll).
+  microstructure refreshes on every tick instead of the 30s macro poll). The same
+  per-tick stream feeds the **cumulative-delta exhaustion** read (see below).
 - **`chart_equity`** on SPY → authoritative 1-minute OHLCV, used for the tape's
   per-minute volume (the index *price* still comes from the `$SPX` poll — see the
   placeholder note; Schwab doesn't stream the cash index).
@@ -269,6 +287,90 @@ pure aggregation/mapping/diff logic is unit-tested without a socket; the live
 socket is covered by a manual smoke test. Tunable in `StreamConfig`. (Scalp's
 premium series stays on the 15s poll path for now — a candidate follow-up.)
 
+## Cumulative delta — the leading exhaustion read (/ES)
+
+Helenus's confirmation triggers (EMA ignition, displacement, ORB, range-expansion,
+level-rejection, level-cross) lag *by construction* — they can't fire until a move has
+matured, so price often continues only a little before reversing. The graded failure
+cluster in `lessons.md` is exactly that: afternoon shorts fired repeatedly into the
+already-held 7340–7350 session-low shelf while buyers quietly absorbed each break.
+
+**Cumulative delta leads price.** It's the running sum of *executed/aggressor* /ES
+volume — buyers lifting the offer (+) vs sellers hitting the bid (−). When price prints
+a new session extreme but cumulative delta does **not** confirm it, the aggressor is
+being *absorbed* and the move is spent **before** price reverses. `engine/cumdelta.py`
+reads this off the `level_one_futures` /ES stream: level-one carries no per-trade
+aggressor tag, so each executed-volume increment is signed by the standard **quote rule
++ tick-rule fallback** (last ≥ ask → buy, ≤ bid → sell, else uptick/downtick, carry the
+prior sign on a flat tick) and accumulated into a session series, tracking the delta
+recorded at each price extreme. Resting book depth is *not* the signal — executed flow is.
+
+Two outputs from one read:
+- **A veto / conviction-cap** on a reactive trigger firing INTO absorption — a short
+  into a low that keeps holding on rising delta (the 7340–7350 cluster that should never
+  have fired). Mechanical and post-verdict, keyed on Claude's direction (like the
+  intermarket boost): it caps confidence to `veto_conf_cap`, or in `hard` mode suppresses
+  the alert. The reversal arm itself is exempt (it *is* the absorption read).
+- **A reversal ARM** (`CD Divergence`) — the early, anticipatory entry the confirmation
+  triggers can't produce. It fires when the divergence appears within `arm_edge_pts` of
+  the matching session extreme, and ranks *ahead* of the lagging reactive triggers in the
+  gate.
+
+**Stream-only by construction** (the 30s REST poll is far too coarse for executed-flow
+classification) and **flag-gated, default off** (`CumDeltaConfig.enabled`): when the /ES
+stream is stale or disabled there is no CD signal and every consumer no-ops, so current
+behavior is preserved until you flip it on. `!stream` shows the live `cum_delta`. Tunable
+in `CumDeltaConfig`.
+
+## Approach / arm — the anticipatory WATCH
+
+Every reactive trigger above can only fire once a move has matured. The approach/arm layer
+is the other half of "earlier": a **two-stage** signal that fires *before* the reactive
+event, off the data Helenus already computes.
+
+- **Stage 1 — the WATCH (arm).** `scan2.detect_approach` watches for price *approaching* a
+  high-probability reaction zone (GEX wall, zero-gamma flip, charm wall, session extreme)
+  **and moving toward it**, with the structural context already favoring a reaction that way
+  — e.g. descending into **charm support** in HIGH-intensity SUPPORTIVE charm (a bullish
+  arm), rising into a **call wall** in positive gamma (a bearish fade), or carrying momentum
+  into the **zero-gamma flip** (the regime-flip watch). It reuses the key-level grid and the
+  `edge_proximity` gate (so an interior wall *pin* never arms) and requires real context, not
+  bare proximity. The arm posts a deliberately **muted "👀 WATCH" embed** — a heads-up, not
+  an entry (no trade plan, grey, never journaled or graded), like the briefings.
+- **Stage 2 — the entry, pre-armed.** The existing reactive trigger remains the entry. When
+  it fires aligned with a live arm, the arm context is handed to Claude (in the snapshot, not
+  the cached prompt) and a bounded, transparent **confidence pre-load** is applied
+  post-verdict (like the intermarket boost), scaled by how many context legs aligned. An
+  opposing Task-1 CD absorption read still caps it. The arm expires after `arm_ttl_bars` or
+  when an aligned entry consumes it.
+
+**Flag-gated, default off** (`ApproachConfig.enabled`): the detector is un-consulted and no
+WATCH posts until you flip it on, so current behavior is preserved. Tunable in
+`ApproachConfig` (`approach_pts`, `arm_ttl_bars`, `confidence_preload`, `require_context`).
+
+## ES-leads-SPX — the micro-lead
+
+Schwab doesn't stream the `$SPX` cash index, so the price tape is folded from ~15s
+polls — every bar `close` is the last poll, up to ~15–30s stale. `/ES` (E-mini S&P
+futures) **is** streamed tick-by-tick and futures lead the cash index, so at bar
+close `/ES` already reflects a move SPX hasn't caught up to.
+
+`engine/es_lead.py` reads a genuine `/ES` momentum **thrust** off the streamed
+`/ES` bar-close series — the *same dual gate* scan2's range expansion uses on SPX
+(an ATR multiple **and** a points floor), so the arm is a real thrust, not noise.
+The bot turns a thrust into a short-lived **ARM**; `scan2` then fires an **ES-Led
+Momentum** candidate the moment the SPX bar starts **CONFIRMING** that direction —
+up to one bar earlier than the SPX-only range expansion would. **ARM on /ES,
+confirm on SPX.** It's re-timing, not de-tuning: the substance is the mature `/ES`
+break plus cash confirmation, and the existing range-expansion trigger is untouched
+as the poll-only fallback. Only `/ES` *displacement* is used (never `/ES` vs SPX
+levels), so the futures basis is irrelevant.
+
+**Flag-gated, default off** (`ESLeadConfig.enabled`) and behind the stream
+staleness gate: when `/ES` is stale or disabled the arm decays to nothing and the
+poll-only path is exactly as before. Tunable in `ESLeadConfig` (`lookback_bars`,
+`atr_mult`, `min_pts`, `arm_ttl_bars`, `confirm_min_pts`).
+
 ## Accuracy feedback loop
 
 Every intraday alert is graded **strictly on underlying SPX price action** over a
@@ -280,12 +382,22 @@ Excursion:
 - Deterministic grade (no model in the loop): **ACCURATE** = real favorable
   excursion with controlled risk (`MFE ≥ target` and `MFE/MAE ≥ ratio`),
   **INACCURATE** = large adverse move with no follow-through, else **MIXED**.
+- **Immediate-reversal rate** (the earliness metric). Making signals fire earlier
+  lowers per-signal hit rate even when it works, so what we grade changes: alongside
+  the 30-bar grade, each alert records the adverse excursion in the **first N bars**
+  (`early_window_bars`) and flags an **early reversal** when it exceeds
+  `early_reversal_pts` — the "fired then reversed" failure. Success is **MFE-from-entry
+  up and early-reversal rate down**, even if raw directional accuracy dips slightly.
+  It's a reported metric (in `!stats` and the review scorecard), not a re-grade; the
+  ACCURATE/MIXED/INACCURATE buckets are unchanged. Entries that fired aligned with a
+  live approach arm are tagged `pre_armed` so the loop can learn whether the earlier
+  (pre-armed) entries grade better.
 
 Alerts and outcomes are written to an append-only JSONL journal
 (`journal/helenus.jsonl`, gitignored). On top of that:
 
-- `!stats` — free deterministic scorecard (accuracy %, avg MFE/MAE/ratio, by
-  trigger). No Claude call.
+- `!stats` — free deterministic scorecard (accuracy %, avg MFE/MAE/ratio,
+  early-reversal rate, by trigger). No Claude call.
 - `!review` (and a daily auto-review at the market close, 16:00 ET) — Claude reads the graded
   history and surfaces the **patterns** separating accurate from inaccurate
   alerts (regime, vanna state, trend alignment, confidence vs outcome), logged as
@@ -344,9 +456,9 @@ python main.py
 The pure-math core — GEX (`engine/gex.py`), charm (`engine/charm.py`), the
 EMA-ignition scalp (`engine/scalp.py`), displacement (`engine/displacement.py`),
 the ORB engine (`engine/orb.py`), the MOC engine (`engine/moc.py`), the streaming
-layer's pure pieces (`data/schwab_stream.py`), and options flow / vanna
-(`engine/flow.py`) — is tested offline with hand-computed fixtures (no Schwab key,
-no network):
+layer's pure pieces (`data/schwab_stream.py`), the /ES cumulative-delta exhaustion
+read (`engine/cumdelta.py`), and options flow / vanna (`engine/flow.py`) — is tested
+offline with hand-computed fixtures (no Schwab key, no network):
 
 ```powershell
 python tests\test_gex.py      # standalone runner, no pytest needed
@@ -357,6 +469,9 @@ python tests\test_orb.py
 python tests\test_moc.py
 python tests\test_stream.py
 python tests\test_flow.py
+python tests\test_cumdelta.py
+python tests\test_approach.py
+python tests\test_es_lead.py
 python tests\test_journal.py
 
 pip install -r requirements-dev.txt   # pulls in pytest

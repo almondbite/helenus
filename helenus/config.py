@@ -166,6 +166,18 @@ class FlowConfig:
     # trigger is suppressed so the mechanical late-day ramp isn't read as signal.
     vix1d_distort_hour: int = 15
     vix1d_distort_minute: int = 45
+    # --- Flow INFLECTION (the early arm) -------------------------------------
+    # The vanna/put-flow level triggers above (vix_drop_pts / min_call_flow) fire
+    # only once flow is already large — late by construction. The inflection arm
+    # fires earlier off the DERIVATIVE: the rate of OTM-flow accumulation
+    # accelerating AND the VIX1D slope rolling over. The level triggers stay as the
+    # confirm/fallback. Default OFF so current behavior is exactly preserved. See
+    # helenus/engine/flow.py:VannaTracker and scan2.detect_candidate (FLOW_INFLECTION).
+    inflection_enabled: bool = False
+    inflection_accel_mult: float = 2.0    # latest interval flow vs the prior-interval mean
+    inflection_min_flow: float = 800.0    # floor so dead-tape noise can't trip it (< min_call_flow)
+    inflection_vix_slope: float = 0.10    # VIX1D pts/interval that counts as a real slope turn
+    inflection_flow_lookback: int = 4     # prior intervals averaged for the acceleration baseline
 
 
 @dataclass(frozen=True)
@@ -363,6 +375,90 @@ class StreamConfig:
 
 
 @dataclass(frozen=True)
+class CumDeltaConfig:
+    """Cumulative-delta exhaustion on /ES — a LEADING reversal read (a different
+    CLASS of signal from the lagging confirmation triggers, with genuine causal
+    lead time). Cumulative delta is the running sum of executed/aggressor /ES
+    volume; when price makes a new session extreme but delta does not confirm it,
+    the move is being absorbed and is spent BEFORE price reverses. Two outputs: a
+    VETO/conviction-cap on reactive triggers firing INTO absorption, and an early
+    reversal ARM when the divergence appears at a structural level.
+
+    Built entirely from the level_one_futures /ES stream Helenus already
+    subscribes to — no new feed. Stream-only by construction (the 30s REST poll is
+    too coarse for executed-flow classification): when the /ES stream is stale or
+    disabled there is no CD signal and every consumer no-ops. See
+    helenus/engine/cumdelta.py."""
+    # Master flag. Defaults OFF so current behavior is exactly preserved until
+    # flipped on — every new call site is a no-op while the bot feeds no reading.
+    enabled: bool = False
+    # Contracts of opposing cumulative delta (vs the delta water-mark recorded at
+    # the shelf) needed before a price extreme counts as absorbed.
+    min_divergence: float = 1500.0
+    # How close to the running extreme a tick counts as "at the shelf" — the
+    # repeated 7340-7350 re-tags must register against the same shelf (index pts).
+    retag_tolerance_pts: float = 2.0
+    # VETO behavior on a reactive trigger firing INTO opposing absorption:
+    #   "cap"  — clamp Claude's confidence to veto_conf_cap (keeps the alert, de-risked)
+    #   "hard" — suppress the alert entirely (return no signal).
+    veto_mode: str = "cap"
+    veto_conf_cap: float = 40.0          # confidence ceiling under "cap" (below the
+                                         # 53-66 band that didn't discriminate outcomes)
+    # Reversal ARM only fires within this many points of the matching session
+    # extreme (the "divergence at a structural level" gate; reuses edge-proximity
+    # semantics so interior pins don't arm).
+    arm_edge_pts: float = 10.0
+
+
+@dataclass(frozen=True)
+class ESLeadConfig:
+    """ES-leads-SPX micro-lead. The $SPX cash index isn't streamable, so the price
+    tape is folded from ~15s polls and each bar close is up to ~15-30s stale. /ES is
+    streamed tick-by-tick and futures lead the cash index, so a genuine /ES thrust
+    ARMS a direction; scan2 fires an ES-led momentum candidate the moment the SPX
+    bar starts confirming it — up to one bar earlier than the SPX-only range
+    expansion. Re-timing, not de-tuning: the substance is the (mature) /ES break
+    plus cash confirmation. Only /ES displacement is used (basis-irrelevant).
+
+    Default OFF so current behavior is exactly preserved; behind the stream
+    staleness gate, the poll-only path is unchanged when /ES is stale/disabled.
+    See helenus/engine/es_lead.py and scan2.detect_candidate (ES_LEAD)."""
+    enabled: bool = False
+    lookback_bars: int = 3              # /ES thrust window (shorter than SPX's 5 — we want the lead)
+    atr_mult: float = 2.0              # |/ES displacement| must clear this × ES-ATR
+    min_pts: float = 4.0               # ...AND this absolute /ES points floor (dual gate)
+    arm_ttl_bars: int = 2              # bars the /ES arm waits for SPX to confirm
+    confirm_min_pts: float = 1.0       # min SPX move (this bar, arm direction) that confirms
+    es_history: int = 30               # /ES bar-close samples kept
+
+
+@dataclass(frozen=True)
+class ApproachConfig:
+    """Approach / arm — stage 1 of the anticipatory two-stage signal. Fires a
+    low-confidence WATCH when price is APPROACHING a high-probability reaction zone
+    (GEX wall, zero-gamma flip, charm wall, session extreme) with aligned
+    structural context, BEFORE the reactive trigger could fire. The existing
+    reactive trigger stays the entry, but fires pre-contextualized with confidence
+    pre-loaded from the arm. Re-uses data Helenus already computes (the key-level
+    grid, charm/regime/flow context, the Task-1 cumulative-delta read).
+
+    Default OFF so current behavior is exactly preserved until flipped on — the arm
+    detector is then un-consulted and no WATCH is posted. See
+    helenus/engine/scan2.py:detect_approach and helenus/output/embeds.py:watch_embed."""
+    enabled: bool = False
+    # "Approaching" tolerance in index points — wider than level_proximity_pts (3)
+    # because it's anticipatory, but tighter than a full range.
+    approach_pts: float = 7.0
+    # How long an arm stays live waiting for the reactive trigger (bars).
+    arm_ttl_bars: int = 5
+    # Bounded points added to an aligned entry's confidence (clamped 95 at the call
+    # site). Scales with how many context legs align (1 leg → half, 2+ → full).
+    confidence_preload: float = 8.0
+    # Proximity alone never arms — a reaction context (charm/regime/flow/CD) must back it.
+    require_context: bool = True
+
+
+@dataclass(frozen=True)
 class FeedbackConfig:
     """Accuracy feedback loop — MFE/MAE grading + the journal."""
     journal_path: str = "journal/helenus.jsonl"
@@ -375,6 +471,11 @@ class FeedbackConfig:
     ratio_target: float = 1.5           # MFE/MAE needed to grade ACCURATE
     mae_floor_pts: float = 0.25         # ratio denominator floor (no div-by-zero)
     net_floor_pts: float = 0.0          # min held net_pts to grade ACCURATE (else MIXED)
+    # Immediate-reversal metric: an alert whose adverse excursion in the FIRST
+    # `early_window_bars` exceeds `early_reversal_pts` "fired then reversed" — the
+    # earliness failure we want to drive DOWN (a reported metric, not a re-grade).
+    early_window_bars: int = 4
+    early_reversal_pts: float = 3.0
     reflect_each_alert: bool = False    # per-alert Claude note (adds one call each)
     review_hour: int = 16               # daily auto-review at the market close (ET)
     review_minute: int = 0
@@ -396,6 +497,9 @@ class HelenusConfig:
     feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
     intermarket: IntermarketConfig = field(default_factory=IntermarketConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
+    cumdelta: CumDeltaConfig = field(default_factory=CumDeltaConfig)
+    approach: ApproachConfig = field(default_factory=ApproachConfig)
+    es_lead: ESLeadConfig = field(default_factory=ESLeadConfig)
 
 
 CONFIG = HelenusConfig()

@@ -26,6 +26,7 @@ from anthropic import AsyncAnthropic
 
 from helenus.config import ANTHROPIC_API_KEY, CONFIG
 from helenus.engine.charm import CharmProfile
+from helenus.engine.cumdelta import CumDeltaReading
 from helenus.engine.flow import VannaReading, VolumeProfile
 from helenus.engine.intermarket import IntermarketProfile
 from helenus.engine.gex import GexProfile
@@ -34,6 +35,7 @@ from helenus.engine.displacement import DisplacementReading
 from helenus.engine.orb import ORBReading
 from helenus.engine.moc import MocReading
 from helenus.engine.scan2 import (
+    ApproachArm,
     Candidate,
     Direction,
     KeyLevel,
@@ -658,6 +660,40 @@ def _intermarket_block(im: IntermarketProfile | None) -> dict[str, Any]:
     return block
 
 
+def _cumdelta_block(cd: CumDeltaReading | None) -> dict[str, Any]:
+    """The /ES cumulative-delta exhaustion read — executed/aggressor flow signed
+    by the quote/tick rule, compared against price at the session extremes. A new
+    extreme on unconfirmed delta is absorption (the move is spent). Only present
+    when the /ES stream is live (stream-only by construction)."""
+    if cd is None:
+        return {"available": False}
+    return {
+        "available": True,
+        "cum_delta": cd.cum_delta,
+        "bullish_absorption": cd.bullish_absorption,
+        "bearish_absorption": cd.bearish_absorption,
+        "arm_direction": cd.arm_direction.value if cd.arm_direction else None,
+        "divergence": cd.divergence,
+        "note": cd.note,
+    }
+
+
+def _approach_block(arm: ApproachArm | None) -> dict[str, Any]:
+    """The anticipatory approach/arm context — present when a WATCH armed this zone
+    before the reactive trigger fired, so the thesis is grounded in the expected
+    reaction. A mechanical confidence pre-load is applied post-verdict (like the
+    intermarket boost), so weigh this qualitatively; don't also pad confidence."""
+    if arm is None:
+        return {"available": False}
+    return {
+        "available": True,
+        "direction": arm.direction.value,
+        "level": f"{arm.level.label} @ {arm.level.price:.2f}",
+        "distance_pts": arm.distance_pts,
+        "reason": arm.reason,
+    }
+
+
 def _snapshot(
     state: MarketState,
     profile: GexProfile,
@@ -671,6 +707,8 @@ def _snapshot(
     intermarket: IntermarketProfile | None,
     macro: dict[str, Any],
     candidate: Candidate,
+    cumdelta: CumDeltaReading | None = None,
+    arm: ApproachArm | None = None,
 ) -> dict[str, Any]:
     """Compact, structured read handed to Claude as the user turn."""
     spot = profile.spot
@@ -745,6 +783,8 @@ def _snapshot(
         "moc": _moc_block(moc),
         "options_flow": _flow_block(vol_profile, vanna),
         "intermarket": _intermarket_block(intermarket),
+        "cumulative_delta": _cumdelta_block(cumdelta),
+        "approach": _approach_block(arm),
         "volume_ratio_vs_20ma": round(state.volume_ratio(), 2)
         if state.volume_ratio() == state.volume_ratio()  # not NaN
         else None,
@@ -848,11 +888,13 @@ class ClaudeAnalyst:
         intermarket: IntermarketProfile | None,
         macro: dict[str, Any],
         candidate: Candidate,
+        cumdelta: CumDeltaReading | None = None,
+        arm: ApproachArm | None = None,
     ) -> Signal | None:
         """Judge a gated candidate. Returns a Signal to alert, or None to stay quiet."""
         snap = _snapshot(
             state, profile, vol_profile, vanna, charm, scalp,
-            displacement, orb, moc, intermarket, macro, candidate
+            displacement, orb, moc, intermarket, macro, candidate, cumdelta, arm
         )
         macro_board = _macro_board(macro)
         user = (
@@ -944,6 +986,40 @@ class ClaudeAnalyst:
                 )
             elif verdict_label == "DIVERGENT":
                 notes.append(f"⚠ Intermarket DIVERGENT: {intermarket.summary(direction)}")
+
+        # Approach/arm pre-load: a reactive entry that fired aligned with a live
+        # WATCH (price had been approaching this reaction zone with the context
+        # already lined up) gets a bounded, transparent confidence pre-load — the
+        # anticipatory half of the two-stage signal paying off. Applied before the
+        # CD veto below, so an opposing absorption read still caps it.
+        if arm is not None:
+            confidence, arm_note = arm.preload(direction, confidence)
+            if arm_note:
+                notes.append(arm_note)
+
+        # /ES cumulative-delta exhaustion veto: a reactive trigger firing INTO
+        # absorption is chasing an already-spent move (the 7340-7350 short cluster).
+        # Mechanical and post-verdict, keyed on the direction Claude chose — like the
+        # intermarket boost above. The CD_REVERSAL arm itself is exempt: it IS the
+        # absorption read, not a chase into it.
+        if (
+            cumdelta is not None
+            and candidate.trigger is not TriggerType.CD_REVERSAL
+            and cumdelta.vetoes(direction)
+        ):
+            cfg = CONFIG.cumdelta
+            if cfg.veto_mode == "hard":
+                log.info(
+                    "CD veto (hard): %s %s into %s — suppressed",
+                    candidate.trigger.value, direction.value, cumdelta.note,
+                )
+                return None
+            if confidence > cfg.veto_conf_cap:
+                notes.append(
+                    f"⚠ CD veto: {direction.value} chases absorbed flow — "
+                    f"confidence capped {confidence:.0f} → {cfg.veto_conf_cap:.0f}. {cumdelta.note}"
+                )
+                confidence = cfg.veto_conf_cap
 
         return Signal(
             trigger=candidate.trigger,

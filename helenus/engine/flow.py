@@ -30,13 +30,14 @@ input, not its job.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from helenus.config import CONFIG
+from helenus.config import CONFIG, FlowConfig
 
 
 # --------------------------------------------------------------------------- #
@@ -169,17 +170,30 @@ class VannaReading:
     bearish_active: bool             # the bearish analogue (put-flow pressure) is live
     label: str
     note: str
+    # --- Inflection (the early arm — the DERIVATIVE, not the level) ---------
+    # Defaults keep every existing construction/caller untouched. Set only when
+    # FlowConfig.inflection_enabled; the level triggers above are the confirm.
+    inflection_active: bool = False      # bullish: vix slope rolling over + call flow accelerating
+    inflection_bearish: bool = False     # bearish mirror (vix turning up + put flow accelerating)
+    call_flow_accel: float = 0.0         # latest OTM-flow interval / prior-interval mean (leading side)
+    vix_slope: float = 0.0               # recent VIX1D slope (pts/interval); < 0 = falling
 
 
 class VannaTracker:
     """
     Stateful: holds the previous VolumeProfile so it can turn cumulative daily
     volume into per-interval *flow*, and reads that flow against the VIX trend.
-    Updated once per chain poll.
+    Updated once per chain poll. Also keeps a short rolling history of the
+    per-interval OTM call/put flow so it can read the DERIVATIVE (the inflection
+    arm) — the rate of flow accumulation, not just its level.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: FlowConfig | None = None) -> None:
+        self.cfg = cfg or CONFIG.flow
         self._prev: VolumeProfile | None = None
+        n = max(self.cfg.inflection_flow_lookback + 1, 2)
+        self._call_flow_hist: deque[float] = deque(maxlen=n)
+        self._put_flow_hist: deque[float] = deque(maxlen=n)
 
     def update(
         self,
@@ -191,7 +205,7 @@ class VannaTracker:
         in the late-day window where VIX1D's measurement window mechanically shrinks
         and ramps into the close — there the trigger is suppressed (the ramp is
         structural, not a real vol move)."""
-        cfg = CONFIG.flow
+        cfg = self.cfg
 
         # Flow = interval delta of cumulative volume. clamp at 0 so the daily
         # reset (today's cumulative < yesterday's) can't fake a surge.
@@ -201,6 +215,20 @@ class VannaTracker:
         else:
             otm_call_flow = otm_put_flow = 0.0
         self._prev = profile
+
+        # Prior-interval flow baseline for the acceleration read — captured from the
+        # history BEFORE appending this interval, so the baseline excludes it. Needs
+        # ≥2 prior intervals so a cold start can't fake an "acceleration".
+        have_base = len(self._call_flow_hist) >= 2
+        call_prior_mean = (
+            sum(self._call_flow_hist) / len(self._call_flow_hist) if self._call_flow_hist else 0.0
+        )
+        put_prior_mean = (
+            sum(self._put_flow_hist) / len(self._put_flow_hist) if self._put_flow_hist else 0.0
+        )
+        self._call_flow_hist.append(otm_call_flow)
+        self._put_flow_hist.append(otm_put_flow)
+        call_accel = otm_call_flow / max(call_prior_mean, 1.0)
 
         # VIX trend over the lookback window.
         vix_change = 0.0
@@ -242,7 +270,38 @@ class VannaTracker:
                     f"VIX1D {vix_change:+.2f} inside the close-window distortion — "
                     "mechanical ramp, not signal; vanna trigger suppressed."
                 ),
+                inflection_active=False,
+                inflection_bearish=False,
+                call_flow_accel=round(call_accel, 2),
+                vix_slope=0.0,
             )
+
+        # --- Inflection (the early arm — the DERIVATIVE) -------------------- #
+        # The level triggers above need the full vix drop + min_call_flow; the
+        # inflection fires earlier off the rate of change: the VIX1D SLOPE rolling
+        # over (the crush starting/steepening) plus OTM-flow ACCELERATION. Gated by
+        # FlowConfig.inflection_enabled so it's dormant until flipped on.
+        ks = 2  # short slope window (macro samples)
+        vix_slope = vix_slope_prev = 0.0
+        if len(vix_history) >= 2 * ks + 1:
+            vix_slope = float(vix_history[-1] - vix_history[-1 - ks])
+            vix_slope_prev = float(vix_history[-1 - ks] - vix_history[-1 - 2 * ks])
+        bull_vix_infl = vix_slope <= -cfg.inflection_vix_slope and vix_slope <= vix_slope_prev
+        bear_vix_infl = vix_slope >= cfg.inflection_vix_slope and vix_slope >= vix_slope_prev
+        bull_flow_accel = (
+            have_base
+            and otm_call_flow >= cfg.inflection_min_flow
+            and otm_call_flow >= cfg.inflection_accel_mult * max(call_prior_mean, 1.0)
+            and otm_call_flow > otm_put_flow
+        )
+        bear_flow_accel = (
+            have_base
+            and otm_put_flow >= cfg.inflection_min_flow
+            and otm_put_flow >= cfg.inflection_accel_mult * max(put_prior_mean, 1.0)
+            and otm_put_flow > otm_call_flow
+        )
+        inflection_active = cfg.inflection_enabled and bull_vix_infl and bull_flow_accel
+        inflection_bearish = cfg.inflection_enabled and bear_vix_infl and bear_flow_accel
 
         if active:
             label = "VANNA MOMENTUM"
@@ -259,6 +318,20 @@ class VannaTracker:
                 f"{otm_put_flow:,.0f} vs call {otm_call_flow:,.0f} "
                 f"({otm_put_flow / max(otm_call_flow, 1.0):.1f}x) — put demand; "
                 "dealer hedging pressures spot lower."
+            )
+        elif inflection_active:
+            label = "VANNA INFLECTION (early)"
+            note = (
+                f"VIX1D slope {vix_slope:+.2f} rolling over with OTM call flow "
+                f"accelerating ({otm_call_flow:,.0f} vs prior ~{call_prior_mean:,.0f}, "
+                f"{call_accel:.1f}×) — vol-crush/hedging lift starting, ahead of the level trigger."
+            )
+        elif inflection_bearish:
+            label = "PUT-FLOW INFLECTION (early)"
+            note = (
+                f"VIX1D slope {vix_slope:+.2f} turning up with OTM put flow "
+                f"accelerating ({otm_put_flow:,.0f} vs prior ~{put_prior_mean:,.0f}) — "
+                "downside hedging starting, ahead of the level trigger."
             )
         elif vix_falling and dominance > 0:
             label = "vanna leaning bullish"
@@ -286,4 +359,8 @@ class VannaTracker:
             bearish_active=bearish_active,
             label=label,
             note=note,
+            inflection_active=inflection_active,
+            inflection_bearish=inflection_bearish,
+            call_flow_accel=round(call_accel, 2),
+            vix_slope=round(vix_slope, 3),
         )

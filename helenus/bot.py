@@ -31,12 +31,17 @@ from helenus.engine import scalp as scalp_engine
 from helenus.engine import displacement as displacement_engine
 from helenus.engine import orb as orb_engine
 from helenus.engine import moc as moc_engine
+from helenus.engine import cumdelta as cumdelta_engine
+from helenus.engine import es_lead as es_lead_engine
 from helenus.engine.analyst import ClaudeAnalyst
 from helenus.engine.scan2 import (
+    ApproachArm,
     Bar,
+    Direction,
     MarketState,
     Signal,
     TriggerType,
+    detect_approach,
     detect_candidate,
 )
 from helenus.journal import (
@@ -125,6 +130,23 @@ class HelenusBot(commands.Bot):
         self.qqq_profile: gex_engine.GexProfile | None = None
         # Freshest assembled intermarket read, set each bar for the embed/journal.
         self.intermarket: intermarket_engine.IntermarketProfile | None = None
+        # /ES cumulative-delta exhaustion read — a leading reversal/veto signal
+        # pulled from the stream each bar (None when disabled or the /ES stream is
+        # stale, so the gate/analyst cleanly get no CD signal).
+        self.cumdelta_reading: cumdelta_engine.CumDeltaReading | None = None
+        # Approach/arm (stage 1) — the live anticipatory WATCH (None when disabled,
+        # expired, or nothing is being approached). When a reactive entry fires
+        # aligned with it, the entry's confidence is pre-loaded. `_arm_ttl` counts
+        # bars remaining before the arm expires; `_watch_log` debounces re-posts.
+        self.active_arm: ApproachArm | None = None
+        self._arm_ttl: int = 0
+        self._watch_log: dict[str, float] = {}
+        # ES-leads-SPX micro-lead — a streamed /ES thrust ARMS a direction; the
+        # gate fires an ES-led candidate the moment SPX confirms. The arm decays
+        # over `_es_arm_ttl` bars and is only fed behind the stream staleness gate.
+        self.es_lead = es_lead_engine.ESLeadTracker()
+        self._es_arm: Direction | None = None
+        self._es_arm_ttl: int = 0
 
         # Accuracy feedback loop
         self.journal = Journal()
@@ -352,10 +374,24 @@ class HelenusBot(commands.Bot):
         # Cheap gate decides whether this bar is worth a Claude call; Claude
         # makes the actual judgment. An active vanna setup, a gated EMA ignition,
         # a sweep, or a level-cross-on-volume can trip it. Most bars don't.
+        # /ES cumulative-delta exhaustion read — None when disabled or the stream
+        # is stale (clean fallback to today's behavior).
+        self.cumdelta_reading = self.stream.cumdelta_reading()
+        # ES-leads-SPX: feed the streamed /ES bar-close into the lead tracker and
+        # maintain the arm (behind the stream staleness gate; arm decays to None
+        # when /ES is stale/disabled, so the poll-only path is unchanged).
+        self._update_es_arm()
+        # Approach/arm (stage 1): the anticipatory WATCH + the entry pre-load.
+        await self._update_arm(
+            detect_approach(
+                self.state, self.profile, self.charm_profile,
+                self.vanna_reading, self.cumdelta_reading,
+            ) if CONFIG.approach.enabled else None
+        )
         candidate = detect_candidate(
             self.state, self.profile, self.vanna_reading, self.charm_profile,
             self.scalp_reading, self.displacement_reading, self.orb_reading,
-            self.moc_reading,
+            self.moc_reading, self.cumdelta_reading, self._es_arm,
         )
         if candidate is None or self._candidate_recently_judged(candidate):
             return
@@ -382,6 +418,8 @@ class HelenusBot(commands.Bot):
             intermarket,
             self.macro_quotes,
             candidate,
+            self.cumdelta_reading,
+            self.active_arm,
         )
         # A transient Claude failure (overload/500) must NOT consume this
         # candidate's cooldown — otherwise one blip silences the trigger+level
@@ -392,6 +430,9 @@ class HelenusBot(commands.Bot):
         self._mark_candidate_judged(candidate)
         if sig is not None:
             await self._dispatch(sig)
+            # An aligned entry consumes the arm — the two-stage signal has paid off.
+            if self.active_arm is not None and sig.direction == self.active_arm.direction:
+                self.active_arm = None
 
     @bar_worker.before_loop
     async def _bar_ready(self) -> None:
@@ -627,6 +668,57 @@ class HelenusBot(commands.Bot):
         verdict (signal or clean no-signal), never on a transient API failure."""
         self._candidate_log[self._candidate_key(candidate)] = asyncio.get_running_loop().time()
 
+    def _update_es_arm(self) -> None:
+        """Feed the streamed /ES bar-close into the lead tracker and maintain the
+        ES arm: a qualified /ES thrust (re)arms a direction for `arm_ttl_bars`; each
+        bar without one ticks the TTL down and clears it at zero. Only fed when the
+        /ES stream is fresh — otherwise the arm decays and the poll-only path is
+        unchanged."""
+        if not (CONFIG.es_lead.enabled and self.stream.is_fresh("es")):
+            if self._es_arm is not None:
+                self._es_arm_ttl -= 1
+                if self._es_arm_ttl <= 0:
+                    self._es_arm = None
+            return
+        es_last = self.stream.es_quote().get("lastPrice")
+        if es_last is not None:
+            self.es_lead.observe(float(es_last))
+        direction = self.es_lead.reading().break_direction
+        if direction is not None:
+            self._es_arm = direction
+            self._es_arm_ttl = CONFIG.es_lead.arm_ttl_bars
+        elif self._es_arm is not None:
+            self._es_arm_ttl -= 1
+            if self._es_arm_ttl <= 0:
+                self._es_arm = None
+
+    async def _update_arm(self, arm: ApproachArm | None) -> None:
+        """Stage-1 arm lifecycle: tick down the live arm's TTL and expire it; then
+        (re)arm on a fresh approach, posting a WATCH heads-up on a NEW arm only
+        (debounced via `_watch_log`). The WATCH is posted directly — like the
+        pre-market / MOC briefings — so it is never journaled or graded as an entry."""
+        if self.active_arm is not None:
+            self._arm_ttl -= 1
+            if self._arm_ttl <= 0:
+                self.active_arm = None
+        if arm is None:
+            return
+        is_new = (
+            self.active_arm is None
+            or self.active_arm.level.price != arm.level.price
+            or self.active_arm.direction != arm.direction
+        )
+        self.active_arm = arm
+        self._arm_ttl = CONFIG.approach.arm_ttl_bars
+        if not is_new:
+            return
+        key = f"WATCH:{arm.level.price:.0f}:{arm.direction.value}"
+        now = asyncio.get_running_loop().time()
+        if now - self._watch_log.get(key, -1e9) < ALERT_COOLDOWN_SECS:
+            return
+        self._watch_log[key] = now
+        await self._post(embeds.watch_embed(arm, self.profile, self.charm_profile))
+
     def _record_alert(self, sig: Signal) -> None:
         """Open MFE/MAE tracking for an intraday alert and journal it."""
         if sig.trigger is TriggerType.PREMARKET_SETUP:
@@ -657,6 +749,14 @@ class HelenusBot(commands.Bot):
             "spy_dir": im.spy.confirms_label if im and im.spy else None,
             "es_imbalance": im.es.imbalance if im and im.es else None,
             "es_volume_flow": round(im.es.volume_flow) if im and im.es else None,
+            # Whether this entry fired aligned with a live approach arm (Task 2) — so
+            # the review/lessons loop can learn if pre-armed (earlier) entries grade
+            # better. The entry's own mfe_pts is already MFE-from-entry.
+            "pre_armed": (
+                self.active_arm.direction.value
+                if self.active_arm is not None and self.active_arm.direction == sig.direction
+                else None
+            ),
         }
         # EMA-ignition scalp context — so the feedback loop / lessons can learn
         # whether the gated 5/9 cross (and its front-run/divergence boosters)
@@ -862,7 +962,7 @@ class HelenusBot(commands.Bot):
         )
         # A flow-driven call (vanna rally or put-flow pressure) is about the
         # volume distribution — attach the breakdown.
-        flow_triggers = (TriggerType.VANNA_RALLY, TriggerType.PUT_FLOW)
+        flow_triggers = (TriggerType.VANNA_RALLY, TriggerType.PUT_FLOW, TriggerType.FLOW_INFLECTION)
         if posted and sig.trigger in flow_triggers and self.vol_profile is not None:
             await self._post(
                 embeds.volume_profile_embed(self.vol_profile, self.vanna_reading)
@@ -997,9 +1097,12 @@ async def cmd_stats(ctx: commands.Context) -> None:
         f"(`{bot.tracker.open_count}` maturing)",
         f"✓ `{s['accurate']}`  ~ `{s['mixed']}`  ✗ `{s['inaccurate']}`",
         f"Avg MFE `{s['avg_mfe_pts']}` / MAE `{s['avg_mae_pts']}` pts | ratio `{s['avg_ratio']}`",
+        f"Early-reversal rate **{s.get('early_reversal_rate', 0)}%** "
+        f"(avg first-bars MAE `{s.get('avg_early_mae_pts', 0)}` pts)",
     ]
     for trig, d in s.get("by_trigger", {}).items():
-        lines.append(f"`{trig}`: {d['ACCURATE']}/{d['n']} accurate")
+        er = f", {d['early_reversal']} early-rev" if d.get("early_reversal") else ""
+        lines.append(f"`{trig}`: {d['ACCURATE']}/{d['n']} accurate{er}")
     await ctx.send("\n".join(lines))
 
 

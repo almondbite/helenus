@@ -35,6 +35,7 @@ from collections import deque
 from typing import Any
 
 from helenus.config import CONFIG, StreamConfig
+from helenus.engine.cumdelta import CumDeltaReading, CumDeltaTracker
 
 log = logging.getLogger("helenus.stream")
 
@@ -210,6 +211,10 @@ class SchwabStream:
         self._es_raw: dict[str, Any] = {}
         self._spy_minute_vol: float | None = None
         self._last: dict[str, float] = {"options": 0.0, "es": 0.0, "spy": 0.0}
+        # /ES cumulative-delta exhaustion read, folded per futures tick (executed
+        # flow → signed cumulative delta). Flag-gated; pulled per bar by the bot
+        # behind the same staleness gate as the rest of the streamed state.
+        self._cumdelta = CumDeltaTracker()
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -343,6 +348,17 @@ class SchwabStream:
                 if k != "key":
                     self._es_raw[k] = v      # merge field-deltas into a running quote
             self._last["es"] = now
+            # Fold the (merged) tick into the cumulative-delta tracker — executed
+            # flow signed by the quote/tick rule. The intermarket path above is
+            # untouched; this is purely additive and only runs when flag-gated on.
+            if CONFIG.cumdelta.enabled:
+                self._cumdelta.observe(
+                    _f(self._es_raw, "LAST_PRICE", "MARK", "CLOSE_PRICE"),
+                    _f(self._es_raw, "BID_PRICE"),
+                    _f(self._es_raw, "ASK_PRICE"),
+                    _f(self._es_raw, "TOTAL_VOLUME"),
+                    now=now,
+                )
 
     def _on_chart(self, msg: dict[str, Any]) -> None:
         now = time.monotonic()
@@ -377,6 +393,13 @@ class SchwabStream:
     def spy_minute_volume(self) -> float | None:
         return self._spy_minute_vol if self.is_fresh("spy") else None
 
+    def cumdelta_reading(self) -> CumDeltaReading | None:
+        """The /ES cumulative-delta exhaustion read, or None when disabled or the
+        /ES stream is stale — so the bot/gate/analyst cleanly get no CD signal."""
+        if not (CONFIG.cumdelta.enabled and self.is_fresh("es")):
+            return None
+        return self._cumdelta.reading()
+
     def status(self) -> dict[str, Any]:
         now = time.monotonic()
 
@@ -393,7 +416,12 @@ class SchwabStream:
                 "fresh": self.is_fresh("options"),
                 "age_s": age("options"),
             },
-            "es": {"symbol": self._es_symbol, "fresh": self.is_fresh("es"), "age_s": age("es")},
+            "es": {
+                "symbol": self._es_symbol,
+                "fresh": self.is_fresh("es"),
+                "age_s": age("es"),
+                "cum_delta": round(self._cumdelta.cum_delta, 1) if CONFIG.cumdelta.enabled else None,
+            },
             "spy": {
                 "symbol": self._spy_symbol,
                 "fresh": self.is_fresh("spy"),

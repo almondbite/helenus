@@ -314,9 +314,13 @@ def test_no_vwap_level_before_any_volume() -> None:
 # Priority order: regime flip > vanna/flow > EMA ignition
 # --------------------------------------------------------------------------- #
 
-def _vanna_stub(active=False, bearish_active=False):
+def _vanna_stub(active=False, bearish_active=False, inflection_active=False, inflection_bearish=False):
     from types import SimpleNamespace
-    return SimpleNamespace(active=active, bearish_active=bearish_active, note="vanna")
+    return SimpleNamespace(
+        active=active, bearish_active=bearish_active,
+        inflection_active=inflection_active, inflection_bearish=inflection_bearish,
+        note="vanna",
+    )
 
 
 def _scalp_stub(active=False):
@@ -347,6 +351,30 @@ def test_regime_flip_outranks_vanna() -> None:
         vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
     )
     assert cand is not None and cand.trigger is TriggerType.REGIME_FLIP
+
+
+def test_flow_inflection_arms_when_only_inflection_is_live() -> None:
+    # No regime flip, no full vanna — only the early inflection arm → FLOW_INFLECTION.
+    st = MarketState()
+    st.push_bar(_bar(7445.0))
+    st.push_bar(_bar(7446.0))
+    cand = detect_candidate(
+        st, _gex(spot=7446.0, zero_gamma=7600.0),
+        vanna=_vanna_stub(inflection_active=True),
+    )
+    assert cand is not None and cand.trigger is TriggerType.FLOW_INFLECTION
+
+
+def test_full_vanna_outranks_inflection() -> None:
+    # The full level trigger fires ahead of the early inflection arm when both live.
+    st = MarketState()
+    st.push_bar(_bar(7445.0))
+    st.push_bar(_bar(7446.0))
+    cand = detect_candidate(
+        st, _gex(spot=7446.0, zero_gamma=7600.0),
+        vanna=_vanna_stub(active=True, inflection_active=True),
+    )
+    assert cand is not None and cand.trigger is TriggerType.VANNA_RALLY
 
 
 # --------------------------------------------------------------------------- #
