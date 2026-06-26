@@ -220,12 +220,44 @@ class IntermarketProfile:
             return "NEUTRAL"
         if qqq.direction != signal_dir:
             return "DIVERGENT"
+        # Split legs: QQQ confirms but SPY actively leans the OTHER way. A single
+        # green leg should not validate a setup the other leg opposes (graded:
+        # a bullish call with QQQ leading green but SPY diverging bearish bled).
+        # Treat the split as a divergence, not a partial confirm.
+        spy_opposes = (
+            self.spy is not None
+            and self.spy.direction is not None
+            and self.spy.direction != signal_dir
+        )
+        if spy_opposes:
+            return "DIVERGENT"
         spy_confirms = self.spy is not None and self.spy.direction == signal_dir
         base = _regime_base(qqq.regime)
         regime_ok = base != "UNKNOWN" and base == _regime_base(self.spx_regime)
         if spy_confirms and regime_ok:
             return "ALIGNED"
         return "PARTIAL"
+
+    def es_opposition_penalty(
+        self, signal_dir: Direction, cfg: IntermarketConfig | None = None
+    ) -> float:
+        """Non-positive points to layer on Claude's confidence when resting /ES
+        order-book imbalance opposes the trade beyond `es_oppose_min`.
+
+        A graded DEMOTION, not a veto (see CONFIG.intermarket.es_oppose_penalty):
+        the opposing-imbalance tell flagged several large-MAE failures but is not
+        decisive, so it shaves a moderate, fixed amount rather than killing the
+        signal. Returns 0.0 when there's no ES read or the tilt isn't opposing."""
+        cfg = cfg or CONFIG.intermarket
+        if self.es is None:
+            return 0.0
+        imb = self.es.imbalance
+        # Opposing = bid-heavy (+) under a short, ask-heavy (-) under a long.
+        opposing = (
+            imb <= -cfg.es_oppose_min if signal_dir is Direction.BULLISH
+            else imb >= cfg.es_oppose_min
+        )
+        return -cfg.es_oppose_penalty if opposing else 0.0
 
     def confidence_boost(
         self, signal_dir: Direction, cfg: IntermarketConfig | None = None

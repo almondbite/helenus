@@ -206,6 +206,38 @@ def test_early_mae_freezes_after_the_early_window() -> None:
     assert outcome.early_reversal is True
 
 
+def _alert_ctx(context: dict, direction: str = "BULLISH") -> OpenAlert:
+    a = _alert(direction)
+    a.context = context
+    return a
+
+
+def test_stats_buckets_by_prior_agreement() -> None:
+    # Two AGREES alerts (one accurate, one not) and one AGAINST (inaccurate) — the
+    # GEX-map validation rollup buckets and averages them per agreement label.
+    with tempfile.TemporaryDirectory() as d:
+        j = Journal(path=os.path.join(d, "j.jsonl"))
+        a1 = _alert_ctx({"prior_agreement": "AGREES", "gex_position_state": "IN_OPEN_SPACE"})
+        j.log_alert(a1)
+        j.log_outcome(a1.id, grade_excursion("BULLISH", 5000, 5012, 4998, 5010, 30))  # ACCURATE
+        a2 = _alert_ctx({"prior_agreement": "AGREES", "gex_position_state": "IN_OPEN_SPACE"})
+        j.log_alert(a2)
+        j.log_outcome(a2.id, grade_excursion("BULLISH", 5000, 5001, 4992, 4993, 30))  # INACCURATE
+        a3 = _alert_ctx({"prior_agreement": "AGAINST", "gex_position_state": "PINNED_AT_WALL"})
+        j.log_alert(a3)
+        j.log_outcome(a3.id, grade_excursion("BULLISH", 5000, 5001, 4992, 4993, 30))  # INACCURATE
+
+        s = j.stats()
+        by_pa = s["by_prior_agreement"]
+        assert by_pa["AGREES"]["n"] == 2
+        assert by_pa["AGREES"]["accuracy_pct"] == 50.0
+        assert by_pa["AGAINST"]["n"] == 1
+        assert by_pa["AGAINST"]["accuracy_pct"] == 0.0
+        # AGREES should out-MFE AGAINST here (the validation the rollup exists to show).
+        assert by_pa["AGREES"]["avg_mfe_pts"] > by_pa["AGAINST"]["avg_mfe_pts"]
+        assert s["by_gex_position"]["PINNED_AT_WALL"]["n"] == 1
+
+
 def test_stats_reports_early_reversal_rate() -> None:
     with tempfile.TemporaryDirectory() as d:
         j = Journal(path=os.path.join(d, "j.jsonl"))

@@ -21,6 +21,11 @@ from helenus.engine.intermarket import (
     _leg_direction,
     build_intermarket,
 )
+
+
+def _es(bid: float, ask: float):
+    """An ESReading with a chosen resting bid/ask imbalance."""
+    return ESTracker().update({"totalVolume": 0, "bidSize": bid, "askSize": ask})
 from helenus.engine.scan2 import Direction
 
 BULL, BEAR = Direction.BULLISH, Direction.BEARISH
@@ -182,6 +187,65 @@ def test_conflicted_regime_base_token_matches() -> None:
         macro_quotes=_quotes(QQQ=0.50, SPY=0.30),
     )
     assert im.alignment(BULL) == "ALIGNED"
+
+
+def test_split_legs_grade_divergent() -> None:
+    # QQQ confirms the bull + regime matches, but SPY actively leans bearish.
+    # One green leg must not validate a setup the other opposes -> DIVERGENT.
+    im = build_intermarket(
+        es_reading=None,
+        spy_profile=_neg_profile(),
+        qqq_profile=_neg_profile(),
+        spx_profile=_neg_profile(),
+        macro_quotes=_quotes(QQQ=0.50, SPY=-0.30),
+    )
+    assert im.alignment(BULL) == "DIVERGENT"
+    assert im.confidence_boost(BULL) == CONFIG.intermarket.divergence_adj
+
+
+# --------------------------------------------------------------------------- #
+# ES opposition penalty — a demotion (not a veto) for opposing /ES imbalance
+# --------------------------------------------------------------------------- #
+
+def test_es_penalty_demotes_opposing_long() -> None:
+    # Ask-heavy /ES (-0.5) opposes a LONG beyond es_oppose_min -> fixed penalty.
+    im = build_intermarket(
+        es_reading=_es(bid=100, ask=300),     # imbalance -0.5
+        spy_profile=None, qqq_profile=None, spx_profile=_neg_profile(),
+        macro_quotes={},
+    )
+    assert im.es_opposition_penalty(BULL) == -CONFIG.intermarket.es_oppose_penalty
+
+
+def test_es_penalty_demotes_opposing_short() -> None:
+    # Bid-heavy /ES (+0.5) opposes a SHORT beyond es_oppose_min -> fixed penalty.
+    im = build_intermarket(
+        es_reading=_es(bid=300, ask=100),     # imbalance +0.5
+        spy_profile=None, qqq_profile=None, spx_profile=_neg_profile(),
+        macro_quotes={},
+    )
+    assert im.es_opposition_penalty(BEAR) == -CONFIG.intermarket.es_oppose_penalty
+
+
+def test_es_penalty_zero_when_aligned_or_small_or_absent() -> None:
+    # Bid-heavy /ES CONFIRMS a long -> no penalty.
+    aligned = build_intermarket(
+        es_reading=_es(bid=300, ask=100), spy_profile=None, qqq_profile=None,
+        spx_profile=_neg_profile(), macro_quotes={},
+    )
+    assert aligned.es_opposition_penalty(BULL) == 0.0
+    # Opposing but BELOW the threshold (|imbalance| 0.2 < 0.4) -> no penalty.
+    mild = build_intermarket(
+        es_reading=_es(bid=100, ask=150), spy_profile=None, qqq_profile=None,
+        spx_profile=_neg_profile(), macro_quotes={},
+    )
+    assert mild.es_opposition_penalty(BULL) == 0.0
+    # No /ES read at all -> no penalty.
+    none = build_intermarket(
+        es_reading=None, spy_profile=None, qqq_profile=None,
+        spx_profile=_neg_profile(), macro_quotes={},
+    )
+    assert none.es_opposition_penalty(BULL) == 0.0
 
 
 def test_boost_clamps_at_95_at_call_site() -> None:

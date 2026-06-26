@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from helenus.engine.orb import ORBReading
     from helenus.engine.moc import MocReading
     from helenus.engine.cumdelta import CumDeltaReading
+    from helenus.engine.gexmap import GexMapState
 
 
 class Direction(Enum):
@@ -662,12 +663,53 @@ def detect_candidate(
 # Approach / arm detector — stage 1 of the anticipatory two-stage signal
 # --------------------------------------------------------------------------- #
 
+def _map_approach_arm(
+    gex_map: "GexMapState", spot: float, heading_up: bool, cfg,
+) -> ApproachArm | None:
+    """Build the anticipatory arm directly off the GEX map when price is APPROACHING a
+    wall / the zero-Γ flip with a directional prior. The arm direction is the reaction
+    the structure expects (a fade into a positive-gamma wall, momentum through the flip);
+    the level is the structure being approached. Pure — `gex_map` already carries the
+    position_state + prior. None when not approaching, no lean, or the map would OFF it."""
+    ps = gex_map.position_state
+    fav = gex_map.prior.favored_direction
+    if ps not in ("APPROACHING_WALL", "APPROACHING_FLIP") or fav is None:
+        return None
+    if ps == "APPROACHING_FLIP" and gex_map.zero_gamma is not None:
+        price, label, weight = float(gex_map.zero_gamma), "Zero-Γ", 0.9
+    else:
+        wall = gex_map.nearest_wall_above if heading_up else gex_map.nearest_wall_below
+        if wall is None:
+            return None
+        kind = "Call Wall" if wall[1] >= 0 else "Put Wall"
+        price, label, weight = float(wall[0]), f"{kind} {wall[0]:.0f}", 0.85
+    # Don't arm a reaction the map itself would turn OFF (e.g. no room for the fade).
+    assessment = gex_map.gate(fav)
+    if assessment.is_off:
+        return None
+    dist = abs(price - spot)
+    frac = 1.0 if assessment.verdict == "PROMOTE" else 0.5
+    preload = round(cfg.confidence_preload * frac, 1)
+    reason = (
+        f"Approaching {label} @ {price:.2f} ({dist:.1f}pt) "
+        f"{fav.value.lower()} — {gex_map.prior.note}"
+    )
+    return ApproachArm(
+        direction=fav,
+        level=KeyLevel(price, label, weight),
+        distance_pts=round(dist, 2),
+        confidence_preload=preload,
+        reason=reason,
+    )
+
+
 def detect_approach(
     state: MarketState,
     gex: GexProfile | None,
     charm: CharmProfile | None = None,
     vanna: "VannaReading | None" = None,
     cumdelta: "CumDeltaReading | None" = None,
+    gex_map: "GexMapState | None" = None,
 ) -> ApproachArm | None:
     """Anticipatory WATCH: is price APPROACHING a high-probability reaction zone
     with the structural context already favoring a reaction in that direction —
@@ -700,6 +742,17 @@ def detect_approach(
     heading_dn = cur.close < prev.close
     if not (heading_up or heading_dn):
         return None
+
+    # GEX-primary arm: the map is known before price arrives, so when price is
+    # APPROACHING a wall / the zero-Γ flip and the structural prior favors a reaction
+    # there, arm that reaction directly off the map+prior (the prior IS the context).
+    # This is where GEX-primary buys earliness. Entry still confirms on the reactive
+    # trigger. The map is passed only when CONFIG.gexmap.enabled (None otherwise), so
+    # this falls back to the legacy grid scan below when the frame is off.
+    if gex_map is not None:
+        map_arm = _map_approach_arm(gex_map, spot, heading_up, cfg)
+        if map_arm is not None:
+            return map_arm
 
     trend = state.trend_direction()
     approach = cfg.approach_pts

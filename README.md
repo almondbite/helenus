@@ -15,6 +15,7 @@ helenus/
   data/schwab_feed.py   schwab-py AsyncClient, SPXW 0DTE fetch, AdaptiveThrottle
   data/schwab_stream.py StreamClient websocket: option premium / /ES / SPY (live)
   engine/gex.py         chain JSON -> DataFrame -> Net GEX, walls, zero-gamma
+  engine/gexmap.py      persistent GEX map: position-in-envelope + directional prior
   engine/charm.py       OTM-wing delta-decay (charm) -> support/overhead drift
   engine/scalp.py       1m 5/9 EMA-ignition scalp: gated cross + premium target
   engine/displacement.py institutional thrust: candle + FVG + MSS (+ sweep)
@@ -71,6 +72,52 @@ scripts/authorize.py    one-time interactive OAuth (writes token file)
    `confidence`, `thesis`, `risk_flags`. Claude may answer `has_signal=false` and
    stay quiet.
 6. `output/embeds.py` renders the `Signal` to a color-coded Discord embed.
+
+## The GEX map — the primary spatial frame
+
+GEX is the **map, not a trigger**. `engine/gexmap.py` maintains a persistent model of
+the dealer-gamma structure across chain polls (a thin stateful wrapper over the pure
+`gex.py` math, mirroring `VannaTracker`): every wall with a **persistence** count (a
+wall that has held across polls is strong/defended; a freshly-formed one is
+provisional), the zero-gamma flip, the regime, and — the new part — **price's position
+within the gamma envelope**: the nearest wall above/below + distance, the wall-bounded
+**cell** price occupies, and a `position_state` in `{PINNED_AT_WALL, IN_OPEN_SPACE,
+APPROACHING_WALL, APPROACHING_FLIP, OVERSHOT_ENVELOPE}`.
+
+From the map *alone* — before any candle event — it emits a **GEX-derived directional
+prior**: positive gamma between walls → mean-revert toward the pin / fade extensions into
+either wall; approaching/through the zero-gamma flip → expect acceleration into the
+negative-gamma zone; pinned at a wall → expect defense (fade) unless absorption shows
+(tied to the CD-divergence read); negative gamma in open space → continuation/trend. The
+prior is **symmetric** — positive gamma fades *both* walls (short into the call wall, long
+into the put wall) by location, never a baked-in directional bias; any short/vol lean
+stays a separate vanna overlay.
+
+The map is **primary**: it is consulted FIRST and every other engine's candidate is
+**scored by its location + agreement with the prior**. A setup that agrees, has room to
+the next opposing magnet, and sits in a favorable regime is high-quality; a candidate
+**into a defended wall / against the prior / no room is turned OFF** (not merely lowered).
+That OFF runs both **pre-Claude** (a mechanical veto for the direction-carrying triggers —
+EMA ignition, displacement, ORB, vanna/put-flow, ES-lead — which skips the Claude call
+entirely) and **post-verdict** (for the direction-agnostic triggers, once Claude's
+direction is known — mirroring the CD hard-veto). The map move triggers themselves (the
+**regime flip** and the **CD divergence** reversal) are exempt — they *are* the map move.
+The lessons-file rules fold in here as map-aware hard gates: the graduated room floor
+(~4pt for momentum edges, ~8pt otherwise), the **stacked same-side wall** cluster keeping
+the full ~8pt regardless, and re-test fatigue via wall persistence.
+
+**Crucially, the map never pulls the trigger.** It owns WHERE and WHETHER; the
+interaction signals still own WHEN — the entry fires on the cross / displacement /
+flow-inflection / CD-divergence / approach-confirm, never on a bare GEX-level touch. The
+**approach/arm** WATCH (below) becomes map-driven: when price is approaching a wall/flip
+with the prior aligned, the arm is emitted off the map+prior before price arrives (where
+GEX-primary buys earliness). The `gex_map` block leads the snapshot handed to Claude, and
+`!scan` shows the live `position_state` / cell / prior. **Flag-gated, default off**
+(`GexMapConfig.enabled`): when off the map is un-maintained, the snapshot block reads
+`available: false`, and no gating happens — current behavior is exactly preserved. The
+feedback loop grades alerts by **GEX cell + prior-agreement** (`!stats` shows the
+agrees-vs-against split in accuracy / MFE / early-reversal), so the map-first ranking is
+validated on the journal, not assumed. Tunable in `GexMapConfig`.
 
 ## The vanna rally (a primary trigger)
 
@@ -462,6 +509,7 @@ offline with hand-computed fixtures (no Schwab key, no network):
 
 ```powershell
 python tests\test_gex.py      # standalone runner, no pytest needed
+python tests\test_gexmap.py
 python tests\test_charm.py
 python tests\test_scalp.py
 python tests\test_displacement.py

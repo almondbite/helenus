@@ -348,6 +348,14 @@ class IntermarketConfig:
     divergence_adj: float = 0.0         # QQQ opposes signal (≤0; 0 = no penalty)
     # |(bidSize - askSize)/(bidSize + askSize)| worth surfacing as an ES tilt.
     es_imbalance_min: float = 0.20
+    # OPPOSING /ES order-book imbalance — graded as a real but PARTIAL failure tell
+    # (it flagged several large-MAE losers, but missed the two worst blowups and
+    # one fresh-low winner won with +0.63 against it). So this is priced as a
+    # MODERATE post-verdict DEMOTION, never a veto: a clean fresh-extreme call keeps
+    # most of its conviction, while a marginal mid-range one drops below the alert
+    # band. A flat penalty keyed on |imbalance| > es_oppose_min opposing the trade.
+    es_oppose_min: float = 0.40
+    es_oppose_penalty: float = 6.0      # points subtracted (>=0; applied as -value)
 
 
 @dataclass(frozen=True)
@@ -459,6 +467,51 @@ class ApproachConfig:
 
 
 @dataclass(frozen=True)
+class GexMapConfig:
+    """GEX-as-primary-frame — the persistent, spatial map every other engine is
+    scored against. GEX is a MAP, not a trigger: it says WHERE reactions are likely
+    and WHETHER a setup agrees with structure; the interaction signals (cross,
+    displacement, flow inflection, CD divergence, approach-arm) still own the entry
+    TIMING. A bare GEX-level touch never fires an alert.
+
+    `gex.py` stays pure/stateless; the maintained model is a thin stateful wrapper
+    (helenus/engine/gexmap.py:GexMapTracker, mirroring flow.VannaTracker) updated
+    each chain poll. It holds every wall with a PERSISTENCE count (a wall that has
+    held across polls is stronger; a fresh one is provisional), the zero-gamma flip,
+    the regime, and derives price's POSITION within the gamma envelope (nearest wall
+    above/below, the cell price occupies, and a position_state). From the map alone
+    it emits a SYMMETRIC directional prior (positive gamma fades BOTH walls equally),
+    which gates/scores every other engine's candidate — agreeing + room + favorable
+    regime promotes it; into a defended wall / against the prior / no room turns it
+    OFF (not merely lowered).
+
+    Default OFF so current behavior is exactly preserved until flipped on — the state
+    model, the snapshot blocks, and the gating are all dormant while disabled (the
+    Measurement task validates on the journal first). See gexmap.py, scan2 (the
+    pre-Claude gate), and analyst.py (the leading snapshot blocks + post-verdict OFF)."""
+    enabled: bool = False
+    # Spot within this of a wall / zero-Γ reads as PINNED_AT_WALL (reuses the
+    # scan "at a level" tolerance).
+    pin_proximity_pts: float = 3.0
+    # Room-to-opposing-magnet floors, mirroring ScalpConfig.min_room_pts / the
+    # analyst's graduated room rule: momentum edges need only ~4pt, everything else
+    # ~8pt, and a stacked same-side wall cluster keeps the full ~8pt regardless
+    # (the graded c0fd93fa 8.6pt-into-three-put-walls failure).
+    momentum_room_pts: float = 4.0
+    default_room_pts: float = 8.0
+    stacked_wall_room_pts: float = 8.0
+    # Two walls within this of each other count as a STACKED same-side cluster
+    # (heavy gamma that absorbs a move into it).
+    stacked_wall_span_pts: float = 10.0
+    # Polls a wall must persist (reappear in the chain) before it counts as STRONG
+    # rather than provisional — feeds the re-test-fatigue / defended-wall reads.
+    persistence_strong: int = 3
+    # "Approaching" tolerance for APPROACHING_WALL / APPROACHING_FLIP and the
+    # map-driven arm (reuses ApproachConfig.approach_pts semantics).
+    approach_pts: float = 7.0
+
+
+@dataclass(frozen=True)
 class FeedbackConfig:
     """Accuracy feedback loop — MFE/MAE grading + the journal."""
     journal_path: str = "journal/helenus.jsonl"
@@ -500,6 +553,7 @@ class HelenusConfig:
     cumdelta: CumDeltaConfig = field(default_factory=CumDeltaConfig)
     approach: ApproachConfig = field(default_factory=ApproachConfig)
     es_lead: ESLeadConfig = field(default_factory=ESLeadConfig)
+    gexmap: GexMapConfig = field(default_factory=GexMapConfig)
 
 
 CONFIG = HelenusConfig()

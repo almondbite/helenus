@@ -181,6 +181,36 @@ def new_alert_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _bucket_by_context(
+    graded: list[dict[str, Any]], key: str
+) -> dict[str, dict[str, Any]]:
+    """Bucket graded alerts by a value in their `context` dict (e.g. prior_agreement),
+    reporting n / accuracy% / avg MFE / early-reversal% per bucket. Alerts missing the
+    key are skipped, so the bucket is empty until the producing feature is enabled."""
+    buckets: dict[str, dict[str, Any]] = {}
+    agg: dict[str, dict[str, float]] = {}
+    for g in graded:
+        val = (g.get("context") or {}).get(key)
+        if val is None:
+            continue
+        a = agg.setdefault(val, {"n": 0, "ACCURATE": 0, "early": 0, "mfe": 0.0})
+        a["n"] += 1
+        if g["grade"] == "ACCURATE":
+            a["ACCURATE"] += 1
+        if g.get("early_reversal"):
+            a["early"] += 1
+        a["mfe"] += g.get("mfe_pts", 0.0)
+    for val, a in agg.items():
+        cnt = int(a["n"])
+        buckets[val] = {
+            "n": cnt,
+            "accuracy_pct": round(a["ACCURATE"] / cnt * 100, 1),
+            "avg_mfe_pts": round(a["mfe"] / cnt, 2),
+            "early_reversal_rate": round(a["early"] / cnt * 100, 1),
+        }
+    return buckets
+
+
 class Journal:
     """Append-only JSONL store of alerts, outcomes, and reviews."""
 
@@ -325,6 +355,12 @@ class Journal:
             "early_reversal_rate": round(early_reversals / n * 100, 1),
             "avg_early_mae_pts": avg("early_mae_pts"),
             "by_trigger": by_trigger,
+            # GEX-map validation: does "agrees-with-prior" actually outperform "against"?
+            # Bucket the graded alerts by their map context (the Stage-5 measurement) —
+            # accuracy %, avg MFE-from-entry, and early-reversal rate per bucket. Empty
+            # until the map is enabled and alerts carry the context.
+            "by_prior_agreement": _bucket_by_context(graded, "prior_agreement"),
+            "by_gex_position": _bucket_by_context(graded, "gex_position_state"),
         }
 
 

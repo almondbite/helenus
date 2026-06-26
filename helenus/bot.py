@@ -26,6 +26,7 @@ from helenus.data import schwab_stream
 from helenus.engine import charm as charm_engine
 from helenus.engine import flow as flow_engine
 from helenus.engine import gex as gex_engine
+from helenus.engine import gexmap as gexmap_engine
 from helenus.engine import intermarket as intermarket_engine
 from helenus.engine import scalp as scalp_engine
 from helenus.engine import displacement as displacement_engine
@@ -97,6 +98,12 @@ class HelenusBot(commands.Bot):
         self.analyst = ClaudeAnalyst()
         self.state = MarketState()
         self.profile: gex_engine.GexProfile | None = None
+        # GEX-as-primary-frame — the persistent spatial map (walls + persistence,
+        # zero-Γ, regime, price's position in the envelope) and its directional prior.
+        # Maintained each chain poll; gates/scores every other candidate when enabled.
+        # None while CONFIG.gexmap.enabled is off (current behavior preserved).
+        self.gexmap_tracker = gexmap_engine.GexMapTracker()
+        self.gex_map: gexmap_engine.GexMapState | None = None
         # Charm (delta-decay) structure — the afternoon-drift bias.
         self.charm_profile: charm_engine.CharmProfile | None = None
 
@@ -174,6 +181,7 @@ class HelenusBot(commands.Bot):
 
         self._alert_log: dict[str, float] = {}
         self._candidate_log: dict[str, float] = {}
+        self._last_map_reason: str = ""   # why the GEX map last vetoed (for the log)
         self._premarket_sent_on: dt.date | None = None
         self._moc_brief_sent_on: dt.date | None = None
 
@@ -277,6 +285,11 @@ class HelenusBot(commands.Bot):
                 if market_session() != "closed":
                     payload = await self.feed.fetch_0dte_chain()
                     self.profile = gex_engine.build_profile(payload)
+                    # Maintain the persistent GEX map (wall persistence + price's
+                    # position in the envelope + the directional prior) — the primary
+                    # frame everything else is scored against. Dormant until enabled.
+                    if CONFIG.gexmap.enabled:
+                        self.gex_map = self.gexmap_tracker.update(self.profile)
                     # Each chain poll is a fresh spot sample (~15s); fold it into
                     # the forming bar so high/low capture true intra-bar range.
                     self._observe_spot(self.profile.spot)
@@ -386,6 +399,7 @@ class HelenusBot(commands.Bot):
             detect_approach(
                 self.state, self.profile, self.charm_profile,
                 self.vanna_reading, self.cumdelta_reading,
+                self.gex_map if CONFIG.gexmap.enabled else None,
             ) if CONFIG.approach.enabled else None
         )
         candidate = detect_candidate(
@@ -394,6 +408,18 @@ class HelenusBot(commands.Bot):
             self.moc_reading, self.cumdelta_reading, self._es_arm,
         )
         if candidate is None or self._candidate_recently_judged(candidate):
+            return
+        # GEX-primary pre-Claude gate: the map is consulted FIRST. For a candidate that
+        # carries an implied direction, score its location/agreement against the map
+        # and SUPPRESS it (skip the Claude call entirely — the strongest, cheapest OFF)
+        # when it's into a defended wall / against the prior / no room. The map move
+        # triggers (regime flip, CD reversal) are exempt; direction-agnostic triggers
+        # fall through to the post-verdict map gate in the analyst. The candidate is NOT
+        # marked judged — the veto is structural and cheap to recompute, so it can fire
+        # later if the map comes to agree. Dormant until CONFIG.gexmap.enabled.
+        if self._map_vetoes(candidate):
+            log.info("GEX map OFF (pre-Claude): %s suppressed — %s",
+                     candidate.trigger.value, self._last_map_reason)
             return
         # Assemble the intermarket read fresh (pure): ES microstructure from the
         # macro loop + SPY/QQQ structure from the intermarket loop + %-change legs.
@@ -420,6 +446,7 @@ class HelenusBot(commands.Bot):
             candidate,
             self.cumdelta_reading,
             self.active_arm,
+            self.gex_map,
         )
         # A transient Claude failure (overload/500) must NOT consume this
         # candidate's cooldown — otherwise one blip silences the trigger+level
@@ -692,6 +719,65 @@ class HelenusBot(commands.Bot):
             if self._es_arm_ttl <= 0:
                 self._es_arm = None
 
+    def _candidate_direction(self, candidate: Candidate) -> Direction | None:
+        """The implied trade direction a candidate carries at gate time, where one
+        exists — so the map can score it BEFORE Claude. Direction-agnostic triggers
+        (level cross/rejection/sweep/range expansion) return None and are gated
+        post-verdict once Claude picks the direction."""
+        t = candidate.trigger
+        if t is TriggerType.EMA_IGNITION and self.scalp_reading is not None:
+            return self.scalp_reading.direction
+        if t is TriggerType.DISPLACEMENT and self.displacement_reading is not None:
+            return self.displacement_reading.direction
+        if t is TriggerType.ORB_BREAKOUT and self.orb_reading is not None:
+            return self.orb_reading.direction
+        if t is TriggerType.VANNA_RALLY:
+            return Direction.BULLISH
+        if t is TriggerType.PUT_FLOW:
+            return Direction.BEARISH
+        if t is TriggerType.FLOW_INFLECTION and self.vanna_reading is not None:
+            if self.vanna_reading.inflection_active:
+                return Direction.BULLISH
+            if self.vanna_reading.inflection_bearish:
+                return Direction.BEARISH
+        if t is TriggerType.ES_LEAD:
+            return self._es_arm
+        return None
+
+    def _cd_absorption(self, direction: Direction) -> bool:
+        """Is there an aligned CD-divergence absorption read in `direction`? Feeds the
+        map's wall-defense override (a defended wall being eaten — the break agrees)."""
+        cd = self.cumdelta_reading
+        if cd is None:
+            return False
+        return (
+            (direction is Direction.BULLISH and cd.bullish_absorption)
+            or (direction is Direction.BEARISH and cd.bearish_absorption)
+        )
+
+    def _map_vetoes(self, candidate: Candidate) -> bool:
+        """Pre-Claude map gate: True when the persistent GEX map turns this candidate
+        OFF (into a defended wall / against the prior / no room). No-op unless
+        CONFIG.gexmap.enabled and the candidate carries an implied direction; the map
+        move triggers are exempt. Records the reason for the log line."""
+        self._last_map_reason = ""
+        if not CONFIG.gexmap.enabled or self.gex_map is None:
+            return False
+        if candidate.trigger in gexmap_engine.MAP_EXEMPT_TRIGGERS:
+            return False
+        direction = self._candidate_direction(candidate)
+        if direction is None:
+            return False
+        assessment = self.gex_map.gate(
+            direction,
+            is_momentum=gexmap_engine.is_momentum_trigger(candidate.trigger),
+            absorption=self._cd_absorption(direction),
+        )
+        if assessment.is_off:
+            self._last_map_reason = "; ".join(assessment.reasons)
+            return True
+        return False
+
     async def _update_arm(self, arm: ApproachArm | None) -> None:
         """Stage-1 arm lifecycle: tick down the live arm's TTL and expire it; then
         (re)arm on a fresh approach, posting a WATCH heads-up on a NEW arm only
@@ -758,6 +844,30 @@ class HelenusBot(commands.Bot):
                 else None
             ),
         }
+        # GEX-map measurement — grade by the cell price occupied, the position_state,
+        # and whether the verdict AGREED with the structural prior. This is how the
+        # journal validates that map-first ranking earns its place: does
+        # "agrees-with-prior + room" actually beat "against" on MFE / early-reversal?
+        gm = self.gex_map
+        if gm is not None:
+            assessment = gm.gate(
+                sig.direction,
+                is_momentum=gexmap_engine.is_momentum_trigger(sig.trigger),
+                absorption=self._cd_absorption(sig.direction),
+            )
+            context.update(
+                {
+                    "gex_cell": gm.cell,
+                    "gex_position_state": gm.position_state,
+                    "gex_prior_behavior": gm.prior.expected_behavior,
+                    "prior_direction": (
+                        gm.prior.favored_direction.value
+                        if gm.prior.favored_direction else None
+                    ),
+                    "prior_agreement": gm.prior.agreement(sig.direction),
+                    "gex_map_verdict": assessment.verdict,   # PROMOTE (agrees+room) | OK
+                }
+            )
         # EMA-ignition scalp context — so the feedback loop / lessons can learn
         # whether the gated 5/9 cross (and its front-run/divergence boosters)
         # actually predicted accuracy. Only present on an EMA_IGNITION alert.
@@ -1059,6 +1169,14 @@ async def cmd_scan(ctx: commands.Context) -> None:
         if st.bars else "Session H/L: `warming up`",
         "Levels: " + ", ".join(f"`{lv.label} {lv.price:.0f}`" for lv in levels[:6]),
     ]
+    gm = bot.gex_map
+    if gm is not None:
+        fav = gm.prior.favored_direction
+        lines.append(
+            f"GEX map: `{gm.position_state}` in `{gm.cell}` | "
+            f"prior `{gm.prior.expected_behavior}` "
+            f"favors `{fav.value if fav else 'NONE'}`"
+        )
     await ctx.send("\n".join(lines))
 
 
@@ -1103,6 +1221,18 @@ async def cmd_stats(ctx: commands.Context) -> None:
     for trig, d in s.get("by_trigger", {}).items():
         er = f", {d['early_reversal']} early-rev" if d.get("early_reversal") else ""
         lines.append(f"`{trig}`: {d['ACCURATE']}/{d['n']} accurate{er}")
+    # GEX-map validation: does agreeing with the structural prior actually pay? Show
+    # the agrees-vs-against split (accuracy, avg MFE, early-reversal) when it's present.
+    by_pa = s.get("by_prior_agreement", {})
+    if by_pa:
+        lines.append("**GEX prior agreement:**")
+        for label in ("AGREES", "AGAINST", "NEUTRAL"):
+            d = by_pa.get(label)
+            if d:
+                lines.append(
+                    f"`{label}`: {d['accuracy_pct']}% acc, MFE `{d['avg_mfe_pts']}`, "
+                    f"early-rev `{d['early_reversal_rate']}%` (n={d['n']})"
+                )
     await ctx.send("\n".join(lines))
 
 

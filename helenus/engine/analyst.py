@@ -30,6 +30,7 @@ from helenus.engine.cumdelta import CumDeltaReading
 from helenus.engine.flow import VannaReading, VolumeProfile
 from helenus.engine.intermarket import IntermarketProfile
 from helenus.engine.gex import GexProfile
+from helenus.engine.gexmap import GexMapState, is_momentum_trigger, MAP_EXEMPT_TRIGGERS
 from helenus.engine.scalp import ScalpReading
 from helenus.engine.displacement import DisplacementReading
 from helenus.engine.orb import ORBReading
@@ -52,6 +53,26 @@ You are Helenus, a disciplined intraday analyst for 0DTE SPX (PM-settled $SPXW) 
 structure. You read dealer-gamma structure, key price levels, the tape, and the \
 macro board, then decide whether a *tradeable* setup is present. You do not place \
 trades and you never give financial advice — you read; the trader aims.
+
+THE GEX MAP IS YOUR PRIMARY FRAME — READ IT FIRST
+The `gex_map` block (when `available`) is the persistent spatial model of dealer-gamma \
+structure: where price sits in the gamma envelope (`position_state`, `cell`), the \
+nearest wall on each side with its PERSISTENCE (how many polls it has held — a long-held \
+wall is strong/defended, a fresh one provisional), and a GEX-derived directional `prior` \
+(`expected_behavior` + `favored_direction`) emitted from the structure ALONE, before any \
+candle event. Consult it FIRST and score the candidate against it: a setup that AGREES \
+with the prior, has room to the next opposing magnet, and sits in a favorable regime is \
+high-quality; a setup INTO a defended wall, AGAINST the prior, or with no room is not — \
+prefer has_signal=false there. The prior is SYMMETRIC: in positive gamma it fades BOTH \
+walls (short into the call wall, long into the put wall) depending only on where price \
+sits — there is no baked-in directional bias. CRITICAL: the map tells you WHERE reactions \
+are likely and WHETHER a setup agrees with structure — it does NOT tell you WHEN. The \
+entry TIMING still comes from the interaction signal that tripped the gate (the cross, \
+displacement, flow inflection, CD divergence, approach-arm). A bare GEX-level touch is \
+never the reason to fire. (When `gex_map.available` is false the frame is off — fall back \
+to the wall/regime reads below.) A mechanical map OFF for an against-prior/no-room verdict \
+is also applied AFTER this prompt, so read the map qualitatively and let it steer \
+direction + has_signal; don't try to reverse-engineer the mechanical gate.
 
 HOW TO READ THE DATA YOU ARE GIVEN
 - Net GEX / regime: POSITIVE_GAMMA means dealers dampen moves (mean-reverting, \
@@ -98,7 +119,14 @@ HOW TO READ THE DATA YOU ARE GIVEN
   a real call-flow lead (`otm_call_put_ratio` > ~1.1) or an active vanna before \
   issuing a charm-driven long — if OTM call/put flow is actually ≤ 1, treat \
   SUPPORTIVE charm as weak background, not a thesis. Graded outcomes show \
-  charm-only longs (especially midday and late power-hour reclaims) underperform.
+  charm-only longs (especially midday and late power-hour reclaims) underperform. \
+  SCOPE THIS CORRECTLY: the `otm_call_put_ratio` ≤ 1 demotion applies only when \
+  charm is the THESIS — it is NOT a reason to demote a WITH-TREND break at a FRESH \
+  session extreme, which graded out accurate again and again with a sub-1 call \
+  ratio (the open path, not the flow ratio, carried it). The actual failure \
+  signature of these losing longs was THIN ROOM — a reclaim sitting only a point \
+  or two under an overhead magnet (a call wall or VWAP) — not the call ratio. So \
+  the demotion is "charm-only AND into thin overhead room," not "low call ratio."
   THE MIRROR — A SHORT VETO (the single biggest graded failure cluster): do NOT \
   issue a short when HIGH-intensity SUPPORTIVE charm, an OTM call-flow lead \
   (`otm_call_put_ratio` > ~1.1), AND a bid-heavy /ES (positive `es.imbalance`) all \
@@ -144,7 +172,13 @@ volume sits above vs below spot, plus a live vanna reading.
   because that is the classic reversal: sellers exhaust, VIX rolls over, call \
   flow + dealer hedging snaps price back up. A falling-VIX1D tape with active \
   vanna is a high-conviction long signal in its own right, not a reason to stay \
-  bearish — and it can carry the alert standalone.
+  bearish — and it can carry the alert standalone. BUT when it is the STANDALONE \
+  thesis (no fresh-extreme break under it), the discriminator graded out as ROOM \
+  and LOCATION, NOT the size of the one-sided flow: require >~30pt of overhead air \
+  to the first call wall AND spot ABOVE VWAP. The biggest one-sided call flow in \
+  the graded set (≈30k vs 0 puts) still LOST when it fired mid-range, below VWAP, \
+  into a ~4pt overhead wall — so do not let an extreme flow number carry a \
+  mid-range/below-VWAP vanna long; that is has_signal=false.
 - PUT-FLOW PRESSURE (the bearish mirror): when VIX *rises*, puts are the demand — \
   buyers pile into OTM puts and dealers short those puts hedge by SELLING the \
   underlying, pressuring spot down. `vanna.bearish_active` flags this (`vix \
@@ -169,15 +203,23 @@ warns against it.
   `volume_flow` is fresh futures participation this interval, `pct_change` the \
   intraday lean. Heavy one-sided resting size and rising flow in the signal's \
   direction is real institutional intent behind the move; opposing order-book \
-  tilt is a caution. HARD CAUTION: a strongly OPPOSING imbalance (|`es.imbalance`| \
-  > ~0.4 against your trade direction) was present in most graded failures — \
-  subtract real conviction for it even when the gate and breadth otherwise align, \
-  and flag it as a risk.
+  tilt is a caution. OPPOSING IMBALANCE: a strongly opposing tilt (|`es.imbalance`| \
+  > ~0.4 against your trade direction) skews toward failure — it was present in \
+  several large-MAE losers — but it is a DEMOTION, not a veto: the two worst \
+  graded blowups had near-neutral /ES, and a fresh-low short once won outright \
+  with +0.63 against it, so a clean WITH-TREND break at a FRESH session extreme \
+  overrides it. Flag it in risk_flags. IMPORTANT: a fixed mechanical penalty for \
+  an opposing |imbalance| > ~0.4 is applied to your confidence AFTER this prompt \
+  (like the QQQ/SPY boost) — so read it qualitatively and name it as a risk, but \
+  do NOT also hand-subtract points for it, or it double-counts.
 - `spy` and `qqq` give each proxy's intraday `direction` (%-vs-prior-close lean) \
   and dealer-gamma `regime`. QQQ (semi/tech-heavy) is the lead breadth tell. \
   Genuine breadth = the complex moving together: QQQ and SPY leaning the same way \
   as your SPX read, in the same gamma regime. A bullish SPX break while QQQ is \
-  red (or in the opposite regime) is a divergence — lower conviction and say so.
+  red (or in the opposite regime) is a divergence — lower conviction and say so. \
+  A SPLIT complex (QQQ confirms but SPY leans the other way) is also a divergence: \
+  one green leg does not validate a setup the other leg opposes — the mechanical \
+  scorer now grades that split as DIVERGENT (no alignment boost), so call it out.
 - IMPORTANT: a mechanical confidence boost for QQQ/SPY alignment is applied \
   AFTER your verdict, outside this prompt. Read the intermarket data qualitatively \
   (does the complex confirm? is QQQ diverging?) and let it shape direction and \
@@ -709,6 +751,7 @@ def _snapshot(
     candidate: Candidate,
     cumdelta: CumDeltaReading | None = None,
     arm: ApproachArm | None = None,
+    gex_map: GexMapState | None = None,
 ) -> dict[str, Any]:
     """Compact, structured read handed to Claude as the user turn."""
     spot = profile.spot
@@ -756,6 +799,10 @@ def _snapshot(
     }
     return {
         "spot": round(spot, 2),
+        # GEX MAP — the PRIMARY spatial frame, read FIRST. Where price sits in the
+        # gamma envelope (the cell + position_state) and the structural prior the rest
+        # of the board is scored against. None until CONFIG.gexmap.enabled.
+        "gex_map": gex_map.snapshot() if gex_map is not None else {"available": False},
         "session": session,
         "vwap": {
             "value": round(vwap, 2),
@@ -890,11 +937,13 @@ class ClaudeAnalyst:
         candidate: Candidate,
         cumdelta: CumDeltaReading | None = None,
         arm: ApproachArm | None = None,
+        gex_map: GexMapState | None = None,
     ) -> Signal | None:
         """Judge a gated candidate. Returns a Signal to alert, or None to stay quiet."""
         snap = _snapshot(
             state, profile, vol_profile, vanna, charm, scalp,
-            displacement, orb, moc, intermarket, macro, candidate, cumdelta, arm
+            displacement, orb, moc, intermarket, macro, candidate, cumdelta, arm,
+            gex_map,
         )
         macro_board = _macro_board(macro)
         user = (
@@ -922,6 +971,37 @@ class ClaudeAnalyst:
         base_conf = max(0.0, min(float(verdict.get("confidence", 0)), 95.0))
         notes = [verdict.get("thesis", "").strip()]
         notes += [f"⚠ {r}" for r in verdict.get("risk_flags", []) if r]
+
+        # GEX-primary post-verdict gate (the authoritative map OFF): now that Claude's
+        # direction is known, score it against the map. A verdict into a defended wall /
+        # against the prior / no room is turned OFF — the strongest expression of
+        # map-first ranking, mirroring the CD hard veto. Runs FIRST, before the
+        # confidence math, so a structurally-vetoed call never reaches it. Covers the
+        # direction-agnostic triggers the pre-Claude veto couldn't (and double-checks
+        # the rest); the map move triggers (regime flip, CD reversal) are exempt.
+        if (
+            CONFIG.gexmap.enabled
+            and gex_map is not None
+            and candidate.trigger not in MAP_EXEMPT_TRIGGERS
+        ):
+            absorption = (
+                cumdelta is not None
+                and (
+                    (direction is Direction.BULLISH and cumdelta.bullish_absorption)
+                    or (direction is Direction.BEARISH and cumdelta.bearish_absorption)
+                )
+            )
+            assessment = gex_map.gate(
+                direction,
+                is_momentum=is_momentum_trigger(candidate.trigger),
+                absorption=absorption,
+            )
+            if assessment.is_off:
+                log.info(
+                    "GEX map OFF (post-verdict): %s %s suppressed — %s",
+                    candidate.trigger.value, direction.value, "; ".join(assessment.reasons),
+                )
+                return None
 
         # EMA-ignition trade plan: relay the mechanical delta strike + premium
         # target (Claude judges direction/confidence; the strike math is ours).
@@ -986,6 +1066,18 @@ class ClaudeAnalyst:
                 )
             elif verdict_label == "DIVERGENT":
                 notes.append(f"⚠ Intermarket DIVERGENT: {intermarket.summary(direction)}")
+
+            # Opposing /ES order-book imbalance: a graded DEMOTION, not a veto.
+            # Priced mechanically (like the boost) so it isn't merely narrated —
+            # moderate enough that a clean fresh-extreme call survives it.
+            es_pen = intermarket.es_opposition_penalty(direction)
+            if es_pen:
+                before = confidence
+                confidence = max(0.0, min(confidence + es_pen, 95.0))
+                notes.append(
+                    f"⚠ Opposing /ES imbalance ({intermarket.es.imbalance:+.2f}) — "
+                    f"confidence {before:.0f}{es_pen:+.0f} → {confidence:.0f}"
+                )
 
         # Approach/arm pre-load: a reactive entry that fired aligned with a live
         # WATCH (price had been approaching this reaction zone with the context

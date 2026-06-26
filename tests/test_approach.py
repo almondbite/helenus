@@ -25,6 +25,7 @@ import pandas as pd
 
 from helenus.engine.charm import CharmProfile
 from helenus.engine.gex import GexProfile
+from helenus.engine.gexmap import GexMapTracker
 from helenus.engine.scan2 import (
     ApproachArm,
     Bar,
@@ -161,6 +162,67 @@ def test_no_arm_when_moving_away_from_support() -> None:
     st = _ascending()
     charm = _charm("SUPPORTIVE", minutes=90, support_walls=[(7350.0, -1e6)])
     assert detect_approach(st, _gex(7357.0), charm) is None
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4 — the GEX-map-driven arm (gex_map overrides the legacy grid scan)
+# --------------------------------------------------------------------------- #
+
+def _map(spot_seed: float, spot_now: float, **gex_kw) -> "object":
+    """Build a GexMapState heading from spot_seed → spot_now (two tracker polls)."""
+    tr = GexMapTracker()
+    tr.update(_gex(spot_seed, **gex_kw))
+    return tr.update(_gex(spot_now, **gex_kw))
+
+
+def test_map_arm_on_approaching_wall() -> None:
+    # Rising into a call wall at 7360 (4pt up) in positive gamma → the map arms the
+    # BEARISH fade, level = the wall, reason carries the prior, full preload (PROMOTE).
+    gex_map = _map(
+        7352.0, 7356.0, call_walls=[(7360.0, 5e8)], put_walls=[(7340.0, -5e8)],
+        zero_gamma=7350.0, total_net_gex=5e8,
+    )
+    assert gex_map.position_state == "APPROACHING_WALL"
+    st = MarketState(prior_close=7400.0)
+    st.push_bar(_bar(7352.0))
+    st.push_bar(_bar(7356.0))   # heading up
+    arm = detect_approach(st, _gex(7356.0), charm=None, gex_map=gex_map)
+    assert arm is not None
+    assert arm.direction is Direction.BEARISH
+    assert arm.level.label == "Call Wall 7360"
+    assert "mean-reversion" in arm.reason
+    assert arm.confidence_preload == 8.0
+
+
+def test_map_arm_on_approaching_flip() -> None:
+    # Rising into the zero-Γ flip at 7360 (4pt up), walls far → APPROACHING_FLIP, the
+    # map arms BULLISH momentum through the pivot, level = Zero-Γ.
+    gex_map = _map(
+        7352.0, 7356.0, call_walls=[(7380.0, 5e8)], put_walls=[(7330.0, -5e8)],
+        zero_gamma=7360.0, total_net_gex=-5e8,
+    )
+    assert gex_map.position_state == "APPROACHING_FLIP"
+    st = MarketState(prior_close=7400.0)
+    st.push_bar(_bar(7352.0))
+    st.push_bar(_bar(7356.0))
+    arm = detect_approach(st, _gex(7356.0), charm=None, gex_map=gex_map)
+    assert arm is not None
+    assert arm.direction is Direction.BULLISH
+    assert arm.level.label == "Zero-Γ"
+
+
+def test_no_map_arm_in_open_space_falls_back() -> None:
+    # Walls 25pt away on both sides → IN_OPEN_SPACE, the map arms nothing, and with no
+    # charm/flow context the legacy scan also stays quiet → None (no spurious arm).
+    gex_map = _map(
+        7351.0, 7355.0, call_walls=[(7380.0, 5e8)], put_walls=[(7330.0, -5e8)],
+        zero_gamma=7350.0, total_net_gex=5e8,
+    )
+    assert gex_map.position_state == "IN_OPEN_SPACE"
+    st = MarketState(prior_close=7400.0)
+    st.push_bar(_bar(7351.0))
+    st.push_bar(_bar(7355.0))
+    assert detect_approach(st, _gex(7355.0), charm=None, gex_map=gex_map) is None
 
 
 # --------------------------------------------------------------------------- #
