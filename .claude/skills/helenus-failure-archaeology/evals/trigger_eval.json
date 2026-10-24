@@ -1,0 +1,23 @@
+[
+  {"query": "let's add a hard veto when ES imbalance opposes the trade", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "has anyone tried filtering on the call/put ratio before", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "why does cumdelta even exist, seems overengineered", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "can we use the confidence number to size positions", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "vanna_active looks useful, let's gate on it", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "which alert ids back the stacked-wall lesson?", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "the flow magnitude was huge on that loser, shouldn't magnitude matter?", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "I feel like this filter idea must have been tried already", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "what were the biggest blowups in the graded history", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "why was regime flip demoted to an info embed", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "3 recent losers had opposing ES, time to bring back the veto", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "whats the evidence behind the 8pt room rule", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "why cant we just use raw spx volume", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "show me the alert record for 78ab2967", "should_trigger": true, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "how do I append a correction to lessons.md properly", "should_trigger": false, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "is 29 alerts enough to conclude anything", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "the stream is stale again", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "what's the history of the roman empire's fall", "should_trigger": false, "expected_skill": null},
+  {"query": "propose a brand new orb variant", "should_trigger": false, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "git log says just 'Add changes', clean up the history?", "should_trigger": false, "expected_skill": "helenus-change-control"},
+  {"query": "translate this docstring to spanish", "should_trigger": false, "expected_skill": null}
+]

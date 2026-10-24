@@ -1,0 +1,23 @@
+[
+  {"query": "I'm going to refactor scan2 while adding the new field, ok?", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "just enable the cumdelta flag, it's clearly better", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "can you also fix the README while you're in there", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "small change: bump the zone min_score default to 50", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "is it ok to edit test_scalp.py so the new mode passes?", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "mark the rework as done and commit everything", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "before I start building the new trigger, what's the process here", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "the legacy test is blocking my change, can I delete it", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "I want to ship this without a flag, it's tiny", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "should I flip GexMapConfig.enabled to True as part of this fix", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "found three other bugs while working, fixing them all now", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "can I say this is verified in the summary?", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "let's tune the gate_volume_ratio live today and see", "should_trigger": true, "expected_skill": "helenus-change-control"},
+  {"query": "add a dated correction to lessons.md for the vanna claim", "should_trigger": false, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "what does detect_candidate return", "should_trigger": false, "expected_skill": "helenus-repo-orientation"},
+  {"query": "why is the stream stale", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "how do I run the tests", "should_trigger": false, "expected_skill": "helenus-build-test-env"},
+  {"query": "rename this variable in my scratch script", "should_trigger": false, "expected_skill": null},
+  {"query": "what's the gex sign convention", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "summarize this article for me", "should_trigger": false, "expected_skill": null},
+  {"query": "does positive charm mean bullish", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"}
+]

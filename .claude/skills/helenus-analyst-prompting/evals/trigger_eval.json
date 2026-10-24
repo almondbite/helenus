@@ -1,0 +1,23 @@
+[
+  {"query": "add a new section to the analyst system prompt", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "why is SYSTEM_PROMPT assembled instead of one string", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "claude api costs doubled this week, what happened", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "put the current date into the methodology prompt", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "move the lessons block up before the methodology for emphasis", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "add a field to the Signal schema", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "should the snapshot include the arm context or the prompt?", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "I added a 5th flag, how does prompt assembly handle it", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "why do reviews run without lessons loaded", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "let claude see the raw chain json instead of the gex block", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "make the analyst answer has_signal true more often", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "enable per-alert reflection notes", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "the _SEC_SCALP sections diverged from the code path, sync them", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "what's cache_control doing in analyst.py", "should_trigger": true, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "what model id should we use for the analyst", "should_trigger": false, "expected_skill": "claude-api"},
+  {"query": "the verdict embeds render wrong colors", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "can local code make the direction call instead of claude", "should_trigger": false, "expected_skill": "helenus-architecture-contract"},
+  {"query": "write a prompt for my customer support bot", "should_trigger": false, "expected_skill": null},
+  {"query": "how do anthropic structured outputs work generally", "should_trigger": false, "expected_skill": "claude-api"},
+  {"query": "curate lessons.md wording", "should_trigger": false, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "what temperature should an llm use for creative writing", "should_trigger": false, "expected_skill": null}
+]

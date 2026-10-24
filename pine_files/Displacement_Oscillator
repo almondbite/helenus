@@ -1,0 +1,413 @@
+//@version=6
+// =============================================================================
+//  DISPLACEMENT OSCILLATOR v6.0  [Quality Engine]
+//  ---------------------------------------------------------------------------
+//  Standalone bottom-pane companion for ATLAS v3. Plots displacement quality
+//  scored by direction, live every tick. Watch conviction build toward the
+//  fire line before the candle closes.
+//
+//  This oscillator uses the SAME conceptual inputs as ATLAS (candle body,
+//  ATR expansion, EMA trend, RSI, volume, HV regime, VWAP, liquidity, delta,
+//  efficiency ratio, FVG, structure break) but with a SIMPLER scoring model
+//  tuned for bottom-pane readability. The fire threshold is calibrated to be
+//  directionally consistent with ATLAS signals -- they will agree the majority
+//  of the time, but are not guaranteed 1:1 because the scoring engines differ.
+//
+//    *  CONVICTION   zero-centered area, -100..+100. Up/green = bull quality,
+//                    down/red = bear quality. The hero line tracks it live.
+//    *  QUALITY      efficiency ratio + FVG + streak (peak at 2, decays after)
+//                    + structure break fold into the signed conviction score.
+//    *  FIRE LINES   dashed guides at the firing threshold (+/-).
+//    *  A+ BANDS     faint guides at +/-85 -- the institutional-tier zone.
+//    *  FLOW         faint columns = net order-flow pressure for context.
+//    *  HUD          a clean in-pane status strip: action, score, tier, and the
+//                    quality factors driving it -- no chart clutter.
+//    *  FIRE DOTS    a marker prints on the bar when BUY / SELL confirms.
+//
+//  Auto-calibrated to your timeframe. Zero config. Pure 7-bit ASCII. Pine v6.
+// =============================================================================
+
+indicator("Displacement Oscillator v6.0 [Quality]", overlay=false)
+
+
+// ---------------------------------------------------------------------------
+//  WEIGHTS  + quality boost ceilings
+// ---------------------------------------------------------------------------
+
+const float W_BODY   = 18.0
+const float W_ATR    = 13.0
+const float W_TREND  = 12.0
+const float W_RSI    = 9.0
+const float W_VOL    = 8.0
+const float W_HV     = 8.0
+const float W_CLOSE  = 7.0
+const float W_VWAP   = 6.0
+const float W_REGIME = 5.0
+const float W_LIQ    = 8.0
+const float W_DELTA  = 6.0
+const float SCORE_MAX = 100.0
+
+const float Q_EFF    = 8.0
+const float Q_FVG    = 8.0
+const float Q_STREAK = 12.0
+const float Q_STRUCT = 10.0
+const float Q_CHOP   = 7.0
+const float Q_SQZ    = 9.0
+
+
+// ---------------------------------------------------------------------------
+//  INPUTS
+// ---------------------------------------------------------------------------
+
+autoCal     = input.bool(true, "Auto-Calibrate to Chart", group="Auto-Pilot")
+sensitivity = input.string("Balanced", "Signal Sensitivity", options=["Conservative","Balanced","Aggressive"], group="Auto-Pilot")
+mtfFilter   = input.bool(true, "Block Counter-Trend Fires", group="Auto-Pilot", tooltip="Matches the main chart: suppresses a fire when the higher-timeframe ladder strongly disagrees.")
+showHud     = input.bool(true, "In-Pane HUD",              group="Display")
+showFlow    = input.bool(true, "Net-Flow Context Columns", group="Display")
+showSqz     = input.bool(true, "Squeeze Track",            group="Display", tooltip="Coil status at the base of the pane: orange dots while a volatility squeeze is ON, a green diamond when it RELEASES.")
+showFire    = input.bool(true, "Fire Markers",             group="Display")
+flashSig    = input.bool(true, "Flash Signal Bar",         group="Display")
+showRead    = input.bool(true, "Right-Margin Readout",     group="Display")
+
+mLength   = input.int(20,    "Lookback",        group="Advanced (manual only)", minval=5, maxval=200)
+mBodyMult = input.float(1.3, "Body Expansion",  group="Advanced (manual only)", minval=0.5, step=0.1)
+mAtrMult  = input.float(1.2, "Range Expansion", group="Advanced (manual only)", minval=0.5, step=0.1)
+mCloseThr = input.float(0.60,"Close Strength",  group="Advanced (manual only)", minval=0.3, step=0.05)
+mMinScore = input.float(60.0,"Fire Threshold",  group="Advanced (manual only)", minval=0.0, maxval=100.0, step=5.0)
+mFlowLen  = input.int(20,    "Flow Window",     group="Advanced (manual only)", minval=3, maxval=100)
+mCooldown = input.int(3,     "Min Bars Between Signals", group="Advanced (manual only)", minval=0, maxval=50)
+
+
+// ---------------------------------------------------------------------------
+//  AUTO-CALIBRATION
+// ---------------------------------------------------------------------------
+
+tfMinutes() =>
+    m = math.max(float(timeframe.multiplier), 1.0)
+    timeframe.isseconds ? m / 60.0 : timeframe.isminutes ? m : timeframe.isdaily ? m * 1440.0 : timeframe.isweekly ? m * 7200.0 : timeframe.ismonthly ? m * 30240.0 : m
+
+tfMin   = tfMinutes()
+isScalp = tfMin <= 3.0
+isIntra = tfMin > 3.0 and tfMin <= 60.0
+
+aLength   = isScalp ? 14  : isIntra ? 20  : 30
+aFlowLen  = isScalp ? 14  : isIntra ? 20  : 28
+aBodyMult = isScalp ? 1.2 : isIntra ? 1.3 : 1.45
+aAtrMult  = isScalp ? 1.1 : isIntra ? 1.2 : 1.3
+aCooldown = isScalp ? 4   : isIntra ? 3   : 2
+
+sensScore = sensitivity == "Conservative" ? 70.0 : sensitivity == "Aggressive" ? 50.0 : 60.0
+sensBody  = sensitivity == "Conservative" ? 1.15 : sensitivity == "Aggressive" ? 0.85 : 1.0
+
+length      = autoCal ? aLength  : mLength
+flowLen     = autoCal ? aFlowLen : mFlowLen
+bodyMult    = (autoCal ? aBodyMult : mBodyMult) * (autoCal ? sensBody : 1.0)
+atrMult     = autoCal ? aAtrMult : mAtrMult
+closeThresh = autoCal ? 0.58     : mCloseThr
+fireLine    = autoCal ? sensScore : mMinScore
+cooldownBars = autoCal ? aCooldown : mCooldown
+
+ema1Len = 8
+ema2Len = 21
+ema3Len = 50
+ema4Len = 200
+rsiLen  = 14
+volMult = 1.3
+ivLen   = 20
+useVol  = true
+
+
+// ---------------------------------------------------------------------------
+//  CANDLE METRICS
+// ---------------------------------------------------------------------------
+
+body_    = math.abs(close - open)
+range_   = high - low
+avgBody  = ta.sma(body_, length)
+atrVal   = ta.atr(length)
+avgVol   = ta.sma(volume, length)
+relBody  = avgBody > 0 ? body_ / avgBody  : 0.0
+relRng   = atrVal  > 0 ? range_ / atrVal  : 0.0
+relVol   = avgVol  > 0 ? volume / avgVol  : 0.0
+closePos = range_  > 0 ? (close - low) / range_ : 0.5
+isBull   = close > open
+isBear   = close < open
+
+
+// ---------------------------------------------------------------------------
+//  MTF LADDER  (powers the counter-trend fire filter)
+// ---------------------------------------------------------------------------
+
+f_bias() =>
+    e1 = ta.ema(close, 8)
+    e2 = ta.ema(close, 21)
+    e3 = ta.ema(close, 50)
+    e1 > e2 and e2 > e3 and close > e3 ? 1 : e1 < e2 and e2 < e3 and close < e3 ? -1 : 0
+
+mtf1 = isScalp ? "1"  : isIntra ? "5"  : "60"
+mtf2 = isScalp ? "5"  : isIntra ? "15" : "D"
+mtf3 = isScalp ? "15" : isIntra ? "60" : "W"
+mtf4 = isScalp ? "60" : isIntra ? "D"  : "M"
+bias1 = request.security(syminfo.tickerid, mtf1, f_bias(), lookahead=barmerge.lookahead_off)
+bias2 = request.security(syminfo.tickerid, mtf2, f_bias(), lookahead=barmerge.lookahead_off)
+bias3 = request.security(syminfo.tickerid, mtf3, f_bias(), lookahead=barmerge.lookahead_off)
+bias4 = request.security(syminfo.tickerid, mtf4, f_bias(), lookahead=barmerge.lookahead_off)
+mtfSum = nz(bias1) + nz(bias2) + nz(bias3) + nz(bias4)
+
+
+// ---------------------------------------------------------------------------
+//  BRAIN  (drives the score)
+// ---------------------------------------------------------------------------
+
+ema1 = ta.ema(close, ema1Len)
+ema2 = ta.ema(close, ema2Len)
+ema3 = ta.ema(close, ema3Len)
+ema4 = ta.ema(close, ema4Len)
+emaBull = ema1 > ema2 and ema2 > ema3
+emaBear = ema1 < ema2 and ema2 < ema3
+rsiCur  = ta.rsi(close, rsiLen)
+
+barsPerYear() =>
+    m = math.max(float(timeframe.multiplier), 1.0)
+    s = timeframe.isseconds ? m : timeframe.isminutes ? m * 60.0 : 0.0
+    d = s > 0.0 ? 252.0 * 23400.0 / math.max(s, 1.0) : 252.0 * 390.0 / m
+    timeframe.ismonthly ? 12.0 : timeframe.isweekly ? 52.0 : timeframe.isdaily ? 252.0 : math.max(d, 252.0)
+
+logRet   = close[1] > 0 ? math.log(close / close[1]) : 0.0
+hvLive   = ta.stdev(logRet, ivLen) * math.sqrt(barsPerYear()) * 100.0
+hv       = hvLive
+hvAvg    = ta.sma(hv, 20)
+hvDailyE = ta.stdev(logRet, 20) * math.sqrt(252.0) * 100.0
+hvDaily  = request.security(syminfo.tickerid, "D", hvDailyE, ignore_invalid_symbol=true)
+hvD      = nz(hvDaily, hv)
+hv52H    = ta.highest(hvD, 252)
+hv52L    = ta.lowest(hvD, 252)
+hvRank   = hv52H > hv52L ? (hvD - hv52L) / (hv52H - hv52L) * 100.0 : 50.0
+hvBodyAdj = hvRank >= 70 ? 0.85 : hvRank <= 30 ? 1.15 : 1.0
+atrSma    = ta.sma(atrVal, 50)
+atrExpand = atrSma > 0 and atrVal / atrSma >= 1.2
+aboveVWAP = close > ta.vwap
+
+delta    = close > open ? volume : close < open ? -volume : 0.0
+deltaMA  = ta.sma(delta, length)
+flowBull = delta > 0 and delta > deltaMA
+flowBear = delta < 0 and delta < deltaMA
+
+liqSweepH  = high > ta.highest(high, length)[1]
+liqSweepL  = low  < ta.lowest(low,  length)[1]
+liqRejBull = liqSweepL and close > open
+liqRejBear = liqSweepH and close < open
+
+var float lastPH = na
+var float lastPL = na
+if high[1] > high[2] and high[1] > high[0]
+    lastPH := high[1]
+if low[1]  < low[2]  and low[1]  < low[0]
+    lastPL := low[1]
+brkBull = not na(lastPH) and close > lastPH
+brkBear = not na(lastPL) and close < lastPL
+
+norm(x, r) =>
+    r > 0 ? math.min(x / r, 1.0) : 0.0
+
+// --- QUALITY LAYER (efficiency . FVG . streak . structure) ---
+erNet  = math.abs(close - close[length])
+erPath = math.sum(math.abs(close - close[1]), length)
+effRatio = erPath > 0 ? erNet / erPath : 0.0
+
+fvgUp     = low > high[2]
+fvgDn     = high < low[2]
+fvgUpSize = fvgUp ? low - high[2] : 0.0
+fvgDnSize = fvgDn ? low[2] - high : 0.0
+fvgUpQ    = atrVal > 0 ? fvgUpSize / atrVal : 0.0
+fvgDnQ    = atrVal > 0 ? fvgDnSize / atrVal : 0.0
+
+dispCandleBull = isBull and relBody >= bodyMult and relRng >= atrMult and closePos >= closeThresh
+dispCandleBear = isBear and relBody >= bodyMult and relRng >= atrMult and (1.0 - closePos) >= closeThresh
+var int streakBull = 0
+var int streakBear = 0
+if dispCandleBull
+    streakBull := streakBull + 1
+    streakBear := 0
+else if dispCandleBear
+    streakBear := streakBear + 1
+    streakBull := 0
+else
+    streakBull := 0
+    streakBear := 0
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+structBull = (not na(pdh) and close > pdh) or brkBull
+structBear = (not na(pdl) and close < pdl) or brkBear
+
+// VOLATILITY SQUEEZE (TTM-style): Bollinger compressed inside Keltner = coil.
+// Both the upper and lower band tests simplify to the same condition
+// (sqzDev < 1.5 * sqzKCr), so only one comparison is needed.
+sqzBasis = ta.sma(close, 20)
+sqzDev   = 2.0 * ta.stdev(close, 20)
+sqzKCr   = ta.sma(ta.tr, 20)
+squeezeOn    = sqzDev < 1.5 * sqzKCr
+squeezeFired = not squeezeOn and squeezeOn[1]
+var int sqzCount = 0
+sqzCount := squeezeOn ? sqzCount + 1 : 0
+
+// Streak scoring: peak at 2 consecutive displacement candles (fresh momentum),
+// then decay -- 4+ candles suggests an extended move prone to mean-reversion.
+streakPts(n) =>
+    n == 1 ? Q_STREAK * 0.5 : n == 2 ? Q_STREAK : n == 3 ? Q_STREAK * 0.35 : n >= 4 ? -Q_CHOP * 0.5 : 0.0
+effPts() =>
+    effRatio >= 0.7 ? Q_EFF : effRatio >= 0.5 ? Q_EFF * 0.6 : effRatio >= 0.35 ? Q_EFF * 0.3 : effRatio < 0.22 ? -Q_CHOP : 0.0
+
+calcScore(bull) =>
+    sBody   = norm(relBody, bodyMult) * W_BODY * hvBodyAdj
+    sAtr    = norm(relRng, atrMult) * W_ATR
+    sTB     = (bull ? emaBull : emaBear) ? W_TREND : ((bull ? ema1 > ema2 : ema1 < ema2) ? W_TREND * 0.5 : 0.0)
+    sTP     = (bull ? brkBull : brkBear) ? 0.0 : -(W_TREND * 0.25)
+    sRsi    = bull ? (rsiCur >= 50 and rsiCur <= 72 ? W_RSI : rsiCur > 72 ? W_RSI * 0.4 : rsiCur >= 45 ? W_RSI * 0.6 : 0.0) : (rsiCur <= 50 and rsiCur >= 28 ? W_RSI : rsiCur < 28 ? W_RSI * 0.4 : rsiCur <= 55 ? W_RSI * 0.6 : 0.0)
+    sVol    = useVol ? norm(relVol, volMult) * W_VOL : W_VOL * 0.6
+    sHv     = hv > hvAvg ? W_HV : W_HV * 0.4
+    sClose  = (bull ? closePos : 1.0 - closePos) >= closeThresh ? W_CLOSE : 0.0
+    sVwap   = (bull ? aboveVWAP : not aboveVWAP) ? W_VWAP : 0.0
+    sRegime = atrExpand ? W_REGIME : W_REGIME * 0.3
+    sLiq    = (bull ? liqRejBull : liqRejBear) ? W_LIQ : (liqSweepL or liqSweepH) ? W_LIQ * 0.4 : 0.0
+    sDelta  = (bull ? flowBull : flowBear) ? W_DELTA : 0.0
+    base    = sBody + sAtr + math.max(sTB + sTP, 0.0) + sRsi + sVol + sHv + sClose + sVwap + sRegime + sLiq + sDelta
+    sEff    = effPts()
+    sFvg    = math.min((bull ? fvgUpQ : fvgDnQ), 1.0) * Q_FVG
+    sStreak = streakPts(bull ? streakBull : streakBear)
+    sStruct = (bull ? structBull : structBear) ? Q_STRUCT : 0.0
+    sSqz    = squeezeFired ? Q_SQZ : squeezeOn ? -3.0 : 0.0
+    boost   = math.max(math.min(sEff + sFvg + sStreak + sStruct + sSqz, 32.0), -Q_CHOP)
+    math.min(math.max((base + boost) / SCORE_MAX * 100.0, 0.0), 100.0)
+
+scoreBull = calcScore(true)
+scoreBear = calcScore(false)
+
+rawBull  = isBull and relBody >= bodyMult and relRng >= atrMult and closePos >= closeThresh and brkBull
+rawBear  = isBear and relBody >= bodyMult and relRng >= atrMult and (1.0 - closePos) >= closeThresh and brkBear
+
+mtfBlockBull = mtfFilter and mtfSum <= -2
+mtfBlockBear = mtfFilter and mtfSum >= 2
+var int lastBullBar = na
+var int lastBearBar = na
+cdBull = na(lastBullBar) or (bar_index - lastBullBar) >= cooldownBars
+cdBear = na(lastBearBar) or (bar_index - lastBearBar) >= cooldownBars
+fireBull = barstate.isconfirmed and rawBull and scoreBull >= fireLine and not mtfBlockBull
+fireBear = barstate.isconfirmed and rawBear and scoreBear >= fireLine and not mtfBlockBear
+dispBull = fireBull and cdBull
+dispBear = fireBear and cdBear
+if dispBull
+    lastBullBar := bar_index
+if dispBear
+    lastBearBar := bar_index
+
+
+// ---------------------------------------------------------------------------
+//  SIGNED CONVICTION  (the hero series, -100..+100)
+// ---------------------------------------------------------------------------
+
+convSigned = scoreBull >= scoreBear ? scoreBull : -scoreBear
+convSmooth = ta.ema(convSigned, 2)
+absScore   = math.abs(convSigned)
+qBull      = scoreBull >= scoreBear
+
+// tiered institutional colors: cyan/magenta at A+ extremes, fading toward zero
+convClr = convSigned >= 0 ? color.new(#00e676, 72) : color.new(#ff5252, 72)
+lineClr = convSigned >= 85 ? #26c6da : convSigned >= fireLine ? #00e676 : convSigned >= 0 ? color.new(#00e676, 35) : convSigned <= -85 ? #d500f9 : convSigned <= -fireLine ? #ff5252 : color.new(#ff5252, 35)
+
+tier(s) =>
+    s >= 85 ? "A+" : s >= 75 ? "A" : s >= 65 ? "B" : "C"
+tierClr(s) =>
+    s >= 85 ? #26c6da : s >= 75 ? #00e676 : s >= 65 ? #ffee58 : #ffa726
+
+// net-flow context, scaled into the same -100..+100 frame
+deltaN   = avgVol > 0 ? delta / avgVol : 0.0
+netFlow  = math.sum(deltaN, flowLen)
+flowScl  = math.max(math.min(netFlow * 10.0, 100.0), -100.0)
+flowClr  = netFlow >= 0 ? color.new(#2ee6a8, 82) : color.new(#ff5d6c, 82)
+
+// live status (updates every tick; FIRE only on a confirmed bar)
+live   = absScore >= fireLine
+sigTxt = dispBull ? "LONG  FIRE" : dispBear ? "SHORT FIRE" : live ? (qBull ? "LONG  live" : "SHORT live") : "STANDBY"
+sigClr = (dispBull or (live and qBull)) ? #00e676 : (dispBear or (live and not qBull)) ? #ff5252 : #78909c
+
+
+// ---------------------------------------------------------------------------
+//  PLOTS
+// ---------------------------------------------------------------------------
+
+// guides
+hline(0,   "Zero",     color=color.new(#5b6b7a, 20), linestyle=hline.style_solid)
+hline(fireLine,  "Fire +", color=color.new(#00e676, 45), linestyle=hline.style_dashed)
+hline(-fireLine, "Fire -", color=color.new(#ff5252, 45), linestyle=hline.style_dashed)
+hline(85,  "A+ up",   color=color.new(#26c6da, 70), linestyle=hline.style_dotted)
+hline(-85, "A+ dn",   color=color.new(#26c6da, 70), linestyle=hline.style_dotted)
+
+// net-flow context columns (behind)
+plot(showFlow ? flowScl : na, "Net Flow", color=flowClr, style=plot.style_columns)
+
+// conviction area + crisp line (the hero)
+plot(convSigned, "Conviction Area", color=convClr, style=plot.style_area)
+plot(convSmooth, "Conviction",      color=color.new(lineClr, 0), linewidth=2)
+
+// squeeze track at the base of the pane (coil status, never fights the wave)
+plotchar(showSqz and squeezeOn and not squeezeFired, "Squeeze On", ".", location.bottom, color=color.new(#ffa726, 20), size=size.small)
+plotshape(showSqz and squeezeFired, "Squeeze Release", shape.diamond, location.bottom, color=#00e676, size=size.tiny)
+
+// fire markers + synced flash
+bgcolor(flashSig and dispBull ? color.new(#00e676, 84) : flashSig and dispBear ? color.new(#ff5252, 84) : na)
+plotshape(showFire and dispBull, "BUY",  shape.triangleup,   location.bottom, #00e676, text="BUY",  textcolor=#0a0e17, size=size.small)
+plotshape(showFire and dispBear, "SELL", shape.triangledown, location.top,    #ff5252, text="SELL", textcolor=#ffffff, size=size.small)
+
+// right-margin readout
+var label cLbl = na
+if showRead and barstate.islast
+    xx  = bar_index + 3
+    tname = scoreBull >= scoreBear ? "L" : "S"
+    txt   = tname + " " + str.tostring(math.round(math.abs(convSigned)))
+    if na(cLbl)
+        cLbl := label.new(xx, convSmooth, "", style=label.style_label_left, size=size.normal)
+    label.set_xy(cLbl, xx, convSmooth)
+    label.set_text(cLbl, txt)
+    label.set_color(cLbl, convSigned >= 0 ? color.new(#00e676, 5) : color.new(#ff5252, 5))
+    label.set_textcolor(cLbl, convSigned >= 0 ? #0a0e17 : #ffffff)
+
+
+// ---------------------------------------------------------------------------
+//  IN-PANE HUD  (clean status strip - action, score, the 4 quality factors)
+// ---------------------------------------------------------------------------
+
+var table hud = table.new(position.top_left, 2, 8, bgcolor=color.new(#0a0e17, 6), border_color=color.new(#16202c, 50), border_width=1, frame_color=color.new(#26c6da, 55), frame_width=1)
+
+hc(r, lbl, val, vc) =>
+    table.cell(hud, 0, r, lbl, text_color=#546e7a, text_size=size.small, text_halign=text.align_left,  bgcolor=color.new(#0a0e17, 0))
+    table.cell(hud, 1, r, val, text_color=vc,       text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#0a0e17, 0))
+
+if showHud and barstate.islast
+    qFvg    = qBull ? fvgUpQ : fvgDnQ
+    qStreak = qBull ? streakBull : streakBear
+    qStruct = qBull ? structBull : structBear
+    table.cell(hud, 0, 0, "CONVICTION", bgcolor=color.new(#0d1b2e, 0), text_color=#26c6da, text_size=size.small, text_halign=text.align_left)
+    table.cell(hud, 1, 0, sigTxt, bgcolor=color.new(#0d1b2e, 0), text_color=sigClr, text_size=size.small, text_halign=text.align_right)
+    hc(1, "SCORE", str.tostring(math.round(absScore)) + "  " + tier(absScore), tierClr(absScore))
+    effClr = effRatio >= 0.5 ? #00e676 : effRatio >= 0.35 ? #ffb300 : #ff5252
+    hc(2, "EFFICIENCY", str.tostring(effRatio, "#.##"), effClr)
+    fvgClr = qFvg >= 0.5 ? #00e676 : qFvg > 0.0 ? #ffb300 : #546e7a
+    hc(3, "FVG x ATR", qFvg > 0.0 ? str.tostring(qFvg, "#.##") : "-", fvgClr)
+    stkClr = qStreak >= 3 ? #00e676 : qStreak == 2 ? #ffb300 : #546e7a
+    hc(4, "STREAK", qStreak > 0 ? "x" + str.tostring(qStreak) : "-", stkClr)
+    hc(5, "STRUCTURE", qStruct ? "BREAK" : "-", qStruct ? #00e676 : #546e7a)
+    sqzTxt = squeezeFired ? "FIRED" : squeezeOn ? "ON x" + str.tostring(sqzCount) : "off"
+    sqzClr = squeezeFired ? #00e676 : squeezeOn ? #ffa726 : #546e7a
+    hc(6, "SQUEEZE", sqzTxt, sqzClr)
+    flowTxt = netFlow >= 0 ? "BUY" : "SELL"
+    hc(7, "FLOW", flowTxt + "  " + str.tostring(netFlow, "#.#"), netFlow >= 0 ? #00e676 : #ff5252)
+
+
+// ---------------------------------------------------------------------------
+//  ALERTS
+// ---------------------------------------------------------------------------
+
+alertcondition(dispBull, title="Long  Fire",  message="LONG {{ticker}} {{interval}}")
+alertcondition(dispBear, title="Short Fire",  message="SHORT {{ticker}} {{interval}}")

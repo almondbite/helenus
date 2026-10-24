@@ -1,0 +1,23 @@
+[
+  {"query": "what does positive net gex mean for how price moves", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "is the put gex sign negative on purpose?", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "explain the vanna rally mechanism", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "why vix1d instead of vix", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "why is charm bullish in the afternoon sometimes", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "how does the quote rule sign the ES delta", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "whats the difference between book imbalance and cumulative delta", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "why does /es lead spx", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "what happens at the 4pm closing auction that moc trades on", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "why cant we query $SPXW chains directly", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "does spx print volume?", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "calls drag puts carry - what does that mean", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "review my change to the charm intensity ramp for correctness", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "how far apart are sq9 rings at spx 7400", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "positive gamma means bullish right?", "should_trigger": true, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "the gex board numbers look wrong today", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "where is the gex math implemented", "should_trigger": false, "expected_skill": "helenus-repo-orientation"},
+  {"query": "did the vanna trigger grade well historically", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "explain options greeks for my finance homework", "should_trigger": false, "expected_skill": null},
+  {"query": "whats the best broker for day trading", "should_trigger": false, "expected_skill": null},
+  {"query": "can zones veto candidates", "should_trigger": false, "expected_skill": "helenus-architecture-contract"}
+]

@@ -19,10 +19,13 @@ require_context=True) and CONFIG.scan (edge_proximity_pts=10, rejection_min_weig
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+from contextlib import contextmanager
 
 import pandas as pd
 
+from helenus.config import CONFIG
 from helenus.engine.charm import CharmProfile
 from helenus.engine.gex import GexProfile
 from helenus.engine.gexmap import GexMapTracker
@@ -39,6 +42,19 @@ from helenus.engine.scan2 import (
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
+
+@contextmanager
+def legacy_gex():
+    """Pin the LEGACY GEX mode (levels_in_signal=True) — the GEX-wall arms, the
+    gamma-sign context leg, and the map-driven arm only exist there (Task 1
+    decoupled GEX levels from the approach pre-load by default)."""
+    old = CONFIG.gex
+    object.__setattr__(CONFIG, "gex", dataclasses.replace(old, levels_in_signal=True))
+    try:
+        yield
+    finally:
+        object.__setattr__(CONFIG, "gex", old)
+
 
 def _bar(c: float, h: float | None = None, l: float | None = None, v: float = 100.0) -> Bar:
     return Bar(
@@ -117,7 +133,8 @@ def test_arms_bearish_into_call_wall_in_positive_gamma() -> None:
     st = _ascending()
     gex = _gex(7357.0, call_walls=[(7360.0, 5e8)], zero_gamma=7350.0, total_net_gex=5e8)
     assert gex.regime == "POSITIVE_GAMMA"
-    arm = detect_approach(st, gex, charm=None)
+    with legacy_gex():
+        arm = detect_approach(st, gex, charm=None)
     assert arm is not None
     assert arm.direction is Direction.BEARISH
     assert arm.level.label.startswith("Call Wall")
@@ -130,7 +147,8 @@ def test_preload_scales_with_aligned_legs() -> None:
     charm = _charm("SUPPORTIVE", minutes=90, support_walls=[(7350.0, -1e6)])
     gex = _gex(7353.0, zero_gamma=7345.0, total_net_gex=5e8)   # POSITIVE_GAMMA
     assert gex.regime == "POSITIVE_GAMMA"
-    arm = detect_approach(st, gex, charm)
+    with legacy_gex():
+        arm = detect_approach(st, gex, charm)
     assert arm is not None and arm.direction is Direction.BULLISH
     assert arm.confidence_preload == 8.0             # 2 legs → full
 
@@ -186,7 +204,8 @@ def test_map_arm_on_approaching_wall() -> None:
     st = MarketState(prior_close=7400.0)
     st.push_bar(_bar(7352.0))
     st.push_bar(_bar(7356.0))   # heading up
-    arm = detect_approach(st, _gex(7356.0), charm=None, gex_map=gex_map)
+    with legacy_gex():
+        arm = detect_approach(st, _gex(7356.0), charm=None, gex_map=gex_map)
     assert arm is not None
     assert arm.direction is Direction.BEARISH
     assert arm.level.label == "Call Wall 7360"
@@ -205,7 +224,8 @@ def test_map_arm_on_approaching_flip() -> None:
     st = MarketState(prior_close=7400.0)
     st.push_bar(_bar(7352.0))
     st.push_bar(_bar(7356.0))
-    arm = detect_approach(st, _gex(7356.0), charm=None, gex_map=gex_map)
+    with legacy_gex():
+        arm = detect_approach(st, _gex(7356.0), charm=None, gex_map=gex_map)
     assert arm is not None
     assert arm.direction is Direction.BULLISH
     assert arm.level.label == "Zero-Γ"

@@ -43,9 +43,11 @@ from helenus.engine.charm import CharmProfile
 from helenus.engine.gex import GexProfile
 
 if TYPE_CHECKING:
+    from helenus.engine.conviction import ConvictionReading
     from helenus.engine.flow import VannaReading
     from helenus.engine.scalp import ScalpReading
     from helenus.engine.displacement import DisplacementReading
+    from helenus.engine.zones import ZoneReading
     from helenus.engine.orb import ORBReading
     from helenus.engine.moc import MocReading
     from helenus.engine.cumdelta import CumDeltaReading
@@ -71,6 +73,7 @@ class TriggerType(Enum):
     ES_LEAD = "ES-Led Momentum"
     EMA_IGNITION = "EMA Ignition"
     DISPLACEMENT = "Displacement"
+    LIQ_REJECT = "Liquidity Sweep Reject"
     ORB_BREAKOUT = "ORB Breakout"
     MOC_REVERSAL = "MOC Reversal"
     CAPITULATION = "Capitulation Candle"
@@ -298,10 +301,12 @@ class MarketState:
         if np.isfinite(vwap):
             levels.append(KeyLevel(vwap, "VWAP", weight=0.85))
 
-        # GEX structure — the highest-information levels the bot is built around.
-        # Call/put walls are dealer-gamma resistance/support; zero-gamma is the
-        # regime pivot. These are what a range-day reaction most often happens at.
-        if gex is not None:
+        # GEX structure — dealer-gamma resistance/support walls + the zero-gamma
+        # regime pivot. Under the Task-1 decoupling (gex.levels_in_signal False,
+        # the default) these are a MANUAL read-out and stay OUT of the grid, so no
+        # trigger fires at a GEX level and neither Claude nor the approach arms
+        # see them; True restores the legacy scored behavior.
+        if gex is not None and CONFIG.gex.levels_in_signal:
             for strike, _net in gex.call_walls:
                 levels.append(
                     KeyLevel(float(strike), f"Call Wall {strike:.0f}", weight=0.85)
@@ -330,6 +335,30 @@ class MarketState:
 # Candidate gate
 # --------------------------------------------------------------------------- #
 
+def detect_regime_flip(state: MarketState, gex: GexProfile | None) -> str | None:
+    """Did the latest bar close across the zero-gamma pivot? Returns the human
+    note, or None. Pure. Runs in BOTH modes: legacy builds the scored
+    REGIME_FLIP candidate from it; decoupled (gex.levels_in_signal False) the bot
+    posts a muted, ungraded info embed instead — the gamma-SIGN regime change
+    stays visible without a GEX level producing has_signal/confidence."""
+    if gex is None or gex.zero_gamma is None or len(state.bars) < 2:
+        return None
+    zg = float(gex.zero_gamma)
+    cur, prev = state.bars[-1], state.bars[-2]
+    crossed_up = prev.close < zg <= cur.close
+    crossed_dn = prev.close > zg >= cur.close
+    if not (crossed_up or crossed_dn):
+        return None
+    regime = (
+        "POSITIVE_GAMMA (mean-revert)" if crossed_up
+        else "NEGATIVE_GAMMA (expansion)"
+    )
+    return (
+        f"Crossed zero-gamma {zg:.0f} "
+        f"{'up' if crossed_up else 'down'} — regime now {regime}"
+    )
+
+
 def detect_candidate(
     state: MarketState,
     gex: GexProfile | None,
@@ -341,6 +370,7 @@ def detect_candidate(
     moc: "MocReading | None" = None,
     cumdelta: "CumDeltaReading | None" = None,
     es_arm: Direction | None = None,
+    conviction: "ConvictionReading | None" = None,
 ) -> Candidate | None:
     """
     Cheap attention gate: is the latest bar interesting enough to spend a Claude
@@ -354,13 +384,24 @@ def detect_candidate(
          while its volume surged vs the other (engine/moc.py); window-gated,
       * a capitulation candle — a contract's premium wicked above its 5/9/200 EMAs
          then rejected (engine/moc.py); a reversal heads-up, fires intraday,
-      1. a regime flip (spot crosses the zero-gamma pivot) — the lead GEX edge,
-      2. a vanna / flow trigger — a vanna rally (VIX1D falling + OTM call flow) or
+      1. a CD divergence reversal arm (cumulative-delta absorption at a session
+         extreme — the leading read; under legacy GEX mode a zero-Γ regime flip
+         still leads it),
+      2. a displacement — a high-volume institutional thrust candle (FVG / MSS /
+         sweep are boosters now, not required — engine/displacement.py); the #1
+         confluence of the reworked stack (Task 4),
+      3. a liquidity sweep-reject — price swept the prior N-bar extreme and
+         closed back inside, with conviction ≥ the fire line (Task 4, the
+         documented personal-edge reversal — engine/conviction.py),
+      4. an EMA ignition — the gated 5/9 cross / 5-EMA reclaim, a primary
+         confluence on 5-MINUTE bars + ITM contracts (Task 2; the 5m read
+         trades earliness for reliability — engine/scalp.py),
+      5. a vanna / flow trigger — a vanna rally (VIX1D falling + OTM call flow) or
          its bearish analogue, put-flow pressure (VIX1D rising + OTM put flow); a
-         PRIMARY standalone signal, fires regardless of any chart pattern,
-      3. an EMA ignition — a gated 1m 5/9 cross / 5-EMA reclaim (engine/scalp.py),
-      4. a displacement — a high-volume institutional thrust candle (FVG / MSS /
-         sweep are boosters now, not required — engine/displacement.py),
+         standalone signal, fires regardless of any chart pattern,
+         (ConvictionConfig.enabled=False falls back to the Task-2 order
+         CD → scalp → displacement → flow; legacy scalp mode to
+         flow → CD → EMA ignition → displacement),
       5. an ORB breakout — a close beyond the locked opening range with volume +
          VWAP confirmation (engine/orb.py),
       6. a liquidity sweep (pierce-and-reclaim of a key level),
@@ -370,8 +411,9 @@ def detect_candidate(
       9. a level cross on elevated volume.
     """
     # The power-hour MOC plays are checked first (window-gated). After the gex
-    # guard the general precedence is regime flip → vanna/flow → EMA ignition →
-    # displacement, then the level-based triggers.
+    # guard the general precedence is [regime flip, legacy GEX mode only] →
+    # CD arm → EMA ignition (5m primary) → displacement → vanna/flow, then the
+    # level-based triggers (legacy scalp mode keeps flow ahead of CD/EMA/disp).
 
     # --- MOC reversal: the power-hour close play (premium + volume) ------- #
     # Inside the 3:50–3:55 window, one side's premium based (a higher-low off a
@@ -379,9 +421,13 @@ def detect_candidate(
     # premium-behavior reversal (engine/moc.py). The priority power-hour play and
     # window-gated, so it's rare; it leads the order.
     if moc is not None and moc.reversal_active:
+        # The nearest-wall GEX pin/overshoot context rides the candidate only in
+        # legacy mode; decoupled, the reversal stands on its premium/volume read
+        # alone (gex_state stays on the !moc board for manual interpretation).
         level = (
             KeyLevel(float(moc.nearest_wall), f"GEX {moc.gex_state}", 0.85)
-            if moc.nearest_wall is not None else None
+            if moc.nearest_wall is not None and CONFIG.gex.levels_in_signal
+            else None
         )
         return Candidate(trigger=TriggerType.MOC_REVERSAL, level=level, reason=moc.note)
 
@@ -392,7 +438,8 @@ def detect_candidate(
     if moc is not None and moc.capitulation:
         level = (
             KeyLevel(float(moc.nearest_wall), f"GEX {moc.gex_state}", 0.6)
-            if moc.nearest_wall is not None else None
+            if moc.nearest_wall is not None and CONFIG.gex.levels_in_signal
+            else None
         )
         return Candidate(trigger=TriggerType.CAPITULATION, level=level, reason=moc.note)
 
@@ -405,50 +452,50 @@ def detect_candidate(
     # --- Regime flip: spot crosses the zero-gamma pivot ------------------ #
     # Positive↔negative gamma is the biggest structural state change there is:
     # dealers flip from damping moves (mean-reversion) to amplifying them
-    # (trend/expansion), or vice-versa. A top-tier structural edge.
-    if gex.zero_gamma is not None:
-        zg = float(gex.zero_gamma)
-        crossed_up = prev.close < zg <= cur.close
-        crossed_dn = prev.close > zg >= cur.close
-        if crossed_up or crossed_dn:
-            regime = (
-                "POSITIVE_GAMMA (mean-revert)" if crossed_up
-                else "NEGATIVE_GAMMA (expansion)"
-            )
+    # (trend/expansion), or vice-versa. Under the Task-1 decoupling the cross is
+    # no longer a scored trigger — the bot posts a muted, unscored info embed off
+    # detect_regime_flip() instead (the sign change is a regime-router label, not
+    # a trade signal). Legacy mode keeps the scored candidate.
+    if CONFIG.gex.levels_in_signal:
+        flip = detect_regime_flip(state, gex)
+        if flip is not None:
             return Candidate(
                 trigger=TriggerType.REGIME_FLIP,
-                level=KeyLevel(zg, "Zero-Γ", 0.9),
-                reason=f"Crossed zero-gamma {zg:.0f} "
-                f"{'up' if crossed_up else 'down'} — regime now {regime}",
+                level=KeyLevel(float(gex.zero_gamma), "Zero-Γ", 0.9),
+                reason=flip,
             )
 
-    # --- Vanna / flow: a PRIMARY standalone trigger (ranked #2) ---------- #
-    # Re-elevated to a primary signal, just under the regime flip: VIX1D falling
-    # with fresh OTM call flow outpacing puts (dealers hedge by buying → spot
-    # lifts), or the bearish mirror (VIX1D rising + OTM put flow → dealer selling).
-    # Fires off the flow read ALONE — regardless of any chart pattern.
-    if vanna is not None and vanna.active:
-        return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
-    if vanna is not None and vanna.bearish_active:
-        return Candidate(trigger=TriggerType.PUT_FLOW, level=None, reason=vanna.note)
+    # --- The primary-confluence block: flow / CD / EMA ignition / displacement.
+    # Each check is a closure so the PRECEDENCE can branch on the Task-2 flag
+    # without duplicating the logic.
 
-    # --- Flow inflection: the EARLY arm (the derivative, not the level) --- #
-    # Ranked just under the full vanna/put-flow level triggers above (those are the
-    # confirm/fallback): the OTM-flow rate is accelerating and the VIX1D slope is
-    # rolling over BEFORE the absolute thresholds trip. Gated in the tracker
-    # (fields are False unless FlowConfig.inflection_enabled), so the poll-only
-    # path is unchanged.
-    if vanna is not None and (vanna.inflection_active or vanna.inflection_bearish):
-        return Candidate(trigger=TriggerType.FLOW_INFLECTION, level=None, reason=vanna.note)
+    def _flow_candidate() -> Candidate | None:
+        # Vanna / flow: a PRIMARY standalone trigger. VIX1D falling with fresh
+        # OTM call flow outpacing puts (dealers hedge by buying → spot lifts), or
+        # the bearish mirror (VIX1D rising + OTM put flow → dealer selling).
+        # Fires off the flow read ALONE — regardless of any chart pattern.
+        if vanna is not None and vanna.active:
+            return Candidate(trigger=TriggerType.VANNA_RALLY, level=None, reason=vanna.note)
+        if vanna is not None and vanna.bearish_active:
+            return Candidate(trigger=TriggerType.PUT_FLOW, level=None, reason=vanna.note)
+        # Flow inflection: the EARLY arm (the derivative, not the level), ranked
+        # just under the full vanna/put-flow level triggers (the confirm/fallback):
+        # the OTM-flow rate is accelerating and the VIX1D slope is rolling over
+        # BEFORE the absolute thresholds trip. Gated in the tracker (fields are
+        # False unless FlowConfig.inflection_enabled), so the poll path is unchanged.
+        if vanna is not None and (vanna.inflection_active or vanna.inflection_bearish):
+            return Candidate(trigger=TriggerType.FLOW_INFLECTION, level=None, reason=vanna.note)
+        return None
 
-    # --- CD divergence: a LEADING reversal arm (ranked ahead of the lagging
-    #     reactive triggers, per the earliness principle) ------------------ #
-    # Cumulative delta on /ES diverged from price AT a session extreme: the move
-    # is being absorbed and is spent before price reverses. This is the early,
-    # anticipatory entry the confirmation triggers below cannot produce. Gated to
-    # the structural level (within arm_edge_pts of the matching session extreme,
-    # reusing edge-proximity semantics) so interior absorption doesn't arm.
-    if cumdelta is not None and cumdelta.arm_direction is not None:
+    def _cd_candidate() -> Candidate | None:
+        # CD divergence: a LEADING reversal arm (ranked ahead of the lagging
+        # reactive triggers, per the earliness principle). Cumulative delta on
+        # /ES diverged from price AT a session extreme: the move is being
+        # absorbed and is spent before price reverses. Gated to the structural
+        # level (within arm_edge_pts of the matching session extreme, reusing
+        # edge-proximity semantics) so interior absorption doesn't arm.
+        if cumdelta is None or cumdelta.arm_direction is None:
+            return None
         edge = CONFIG.cumdelta.arm_edge_pts
         arm = cumdelta.arm_direction
         at_low = (
@@ -467,24 +514,30 @@ def detect_candidate(
                 level=KeyLevel(float(extreme), label, 0.85),
                 reason=cumdelta.note,
             )
+        return None
 
-    # --- EMA ignition: the gated 1m 5/9 contract scalp (a MAIN EDGE) ----- #
-    # The 1m 5/9 momentum scalp. The scalp engine already ran its confirmation
-    # stack (vanna headwind, SPX confirm on VWAP, room ≥ floor, chop, dual-bleed,
-    # spread); regime is no longer a hard gate — a high-positive-GEX fire is flagged
-    # `slow_grind` rather than blocked. The level it carries is the premium target.
-    if scalp is not None and scalp.active:
-        return Candidate(
-            trigger=TriggerType.EMA_IGNITION,
-            level=scalp.target_level,
-            reason=scalp.note,
-        )
+    def _scalp_candidate() -> Candidate | None:
+        # EMA ignition: the gated 5/9 contract scalp — a PRIMARY confluence (5m
+        # bars + ITM contract under ScalpConfig.confluence_5m; 1m/OTM legacy).
+        # The scalp engine already ran its confirmation stack (vanna headwind,
+        # SPX confirm on VWAP, room ≥ floor, chop, dual-bleed, spread); regime is
+        # not a hard gate — a high-positive-GEX fire is flagged `slow_grind`
+        # rather than blocked. The level it carries is the premium target.
+        if scalp is not None and scalp.active:
+            return Candidate(
+                trigger=TriggerType.EMA_IGNITION,
+                level=scalp.target_level,
+                reason=scalp.note,
+            )
+        return None
 
-    # --- Displacement: the high-volume institutional thrust candle ------- #
-    # The candle itself is the hard gate now; FVG / MSS / sweep are conviction
-    # boosters (engine/displacement.py). The level is the swing the thrust broke
-    # (MSS) when present, else the candle's defended 50% midpoint.
-    if displacement is not None and displacement.active:
+    def _displacement_candidate() -> Candidate | None:
+        # Displacement: the high-volume institutional thrust candle. The candle
+        # itself is the hard gate; FVG / MSS / sweep are conviction boosters
+        # (engine/displacement.py). The level is the swing the thrust broke (MSS)
+        # when present, else the candle's defended 50% midpoint.
+        if displacement is None or not displacement.active:
+            return None
         if displacement.mss_level is not None:
             level = KeyLevel(float(displacement.mss_level), "MSS Break", 0.85)
         elif displacement.midpoint is not None:
@@ -496,6 +549,65 @@ def detect_candidate(
             level=level,
             reason=displacement.note,
         )
+
+    def _liq_reject_candidate() -> Candidate | None:
+        # Liquidity sweep-reject (Task 4 — the documented personal-edge piece):
+        # price SWEPT the prior N-bar extreme intra-bar and closed back inside —
+        # the trap. Ported from the oscillator's liqRejBull/Bear and gated on the
+        # side's conviction score clearing the fire line, so a bare sweep on a
+        # weak candle doesn't spend a Claude call. The swept extreme is the level.
+        if conviction is None or not CONFIG.conviction.enabled:
+            return None
+        fire = CONFIG.conviction.fire_line
+        if conviction.liq_rej_bull and conviction.score_bull >= fire:
+            level = (
+                KeyLevel(float(conviction.swept_low), "Swept Low", 0.85)
+                if conviction.swept_low is not None else None
+            )
+            return Candidate(
+                trigger=TriggerType.LIQ_REJECT,
+                level=level,
+                reason=f"Swept the prior low and closed back inside — {conviction.note}",
+            )
+        if conviction.liq_rej_bear and conviction.score_bear >= fire:
+            level = (
+                KeyLevel(float(conviction.swept_high), "Swept High", 0.85)
+                if conviction.swept_high is not None else None
+            )
+            return Candidate(
+                trigger=TriggerType.LIQ_REJECT,
+                level=level,
+                reason=f"Swept the prior high and closed back inside — {conviction.note}",
+            )
+        return None
+
+    # Precedence. Each flag governs its own axis so pinning one mode doesn't
+    # drag the other along: ConvictionConfig.enabled promotes the displacement
+    # family (displacement + its sweep-reject sibling) to the top, right behind
+    # the CD arm; ScalpConfig.confluence_5m decides scalp-vs-flow. The default
+    # (both on) is the FINAL reworked stack:
+    #   CD → displacement → liq-reject → EMA(5m) → flow → …
+    # Task-2-only: CD → scalp → displacement → flow. Full legacy:
+    # flow → CD → scalp → displacement.
+    if CONFIG.conviction.enabled:
+        if CONFIG.scalp.confluence_5m:
+            precedence = (
+                _cd_candidate, _displacement_candidate, _liq_reject_candidate,
+                _scalp_candidate, _flow_candidate,
+            )
+        else:
+            precedence = (
+                _cd_candidate, _displacement_candidate, _liq_reject_candidate,
+                _flow_candidate, _scalp_candidate,
+            )
+    elif CONFIG.scalp.confluence_5m:
+        precedence = (_cd_candidate, _scalp_candidate, _displacement_candidate, _flow_candidate)
+    else:
+        precedence = (_flow_candidate, _cd_candidate, _scalp_candidate, _displacement_candidate)
+    for check in precedence:
+        cand = check()
+        if cand is not None:
+            return cand
 
     # --- ORB breakout: a confirmed close beyond the opening range -------- #
     # The first-N-minute range is the session pivot; a close beyond it with
@@ -710,6 +822,7 @@ def detect_approach(
     vanna: "VannaReading | None" = None,
     cumdelta: "CumDeltaReading | None" = None,
     gex_map: "GexMapState | None" = None,
+    zone_reading: "ZoneReading | None" = None,
 ) -> ApproachArm | None:
     """Anticipatory WATCH: is price APPROACHING a high-probability reaction zone
     with the structural context already favoring a reaction in that direction —
@@ -748,8 +861,9 @@ def detect_approach(
     # there, arm that reaction directly off the map+prior (the prior IS the context).
     # This is where GEX-primary buys earliness. Entry still confirms on the reactive
     # trigger. The map is passed only when CONFIG.gexmap.enabled (None otherwise), so
-    # this falls back to the legacy grid scan below when the frame is off.
-    if gex_map is not None:
+    # this falls back to the legacy grid scan below when the frame is off. An arm's
+    # pre-load is scoring, so the map arm is legacy-only (Task-1 decoupling).
+    if gex_map is not None and CONFIG.gex.levels_in_signal:
         map_arm = _map_approach_arm(gex_map, spot, heading_up, cfg)
         if map_arm is not None:
             return map_arm
@@ -760,7 +874,10 @@ def detect_approach(
     prior = list(state.bars)[:-1]
     prior_low = min(b.low for b in prior)
     prior_high = max(b.high for b in prior)
-    pos_gamma = gex.regime.startswith("POSITIVE")
+    # A context leg feeds the confidence pre-load — that's scoring, so the
+    # gamma-sign leg only counts in legacy mode (decoupled, the sign is a label
+    # for routing, never points).
+    pos_gamma = CONFIG.gex.levels_in_signal and gex.regime.startswith("POSITIVE")
 
     best: tuple[tuple[int, float], ApproachArm] | None = None
     for lv in state.key_levels(spot, gex, charm):
@@ -793,6 +910,15 @@ def detect_approach(
                 legs.append("CD bullish absorption")
             if vanna is not None and vanna.active:
                 legs.append("vanna active")
+            # Task 4: a live bullish displacement zone just below is persistent
+            # demand structure backing the bounce.
+            if zone_reading is not None and zone_reading.nearest_bull_below is not None:
+                zb = zone_reading.nearest_bull_below
+                if zb.state != "BROKEN" and (spot - zb.top) <= CONFIG.zones.approach_pts:
+                    legs.append(
+                        f"live bull zone {zb.bottom:.0f}-{zb.top:.0f} "
+                        f"({zb.state.lower()}, {zb.touches} touch(es))"
+                    )
         elif lv.price > spot and heading_up and trend != Direction.BEARISH:
             # Resistance approached from below → a fade. Must be near the ceiling.
             if (prior_high - lv.price) > edge:
@@ -807,6 +933,15 @@ def detect_approach(
                 legs.append("CD bearish absorption")
             if vanna is not None and vanna.bearish_active:
                 legs.append("put-flow pressure")
+            # Task 4: a live bearish displacement zone just above is persistent
+            # supply structure backing the fade.
+            if zone_reading is not None and zone_reading.nearest_bear_above is not None:
+                za = zone_reading.nearest_bear_above
+                if za.state != "BROKEN" and (za.bottom - spot) <= CONFIG.zones.approach_pts:
+                    legs.append(
+                        f"live bear zone {za.bottom:.0f}-{za.top:.0f} "
+                        f"({za.state.lower()}, {za.touches} touch(es))"
+                    )
         else:
             continue
 

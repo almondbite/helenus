@@ -12,14 +12,28 @@ bar-close series) and the two-stage candidate: ARM on /ES, CONFIRM on SPX.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+from contextlib import contextmanager
 
 import pandas as pd
 
-from helenus.config import ESLeadConfig
+from helenus.config import CONFIG, ESLeadConfig
 from helenus.engine.es_lead import ESLeadReading, ESLeadTracker
 from helenus.engine.gex import GexProfile
 from helenus.engine.scan2 import Bar, Direction, MarketState, TriggerType, detect_candidate
+
+
+@contextmanager
+def legacy_gex():
+    """Pin the LEGACY GEX mode (levels_in_signal=True) — the scored REGIME_FLIP
+    trigger only exists there (Task 1 demoted it to an unscored info post)."""
+    old = CONFIG.gex
+    object.__setattr__(CONFIG, "gex", dataclasses.replace(old, levels_in_signal=True))
+    try:
+        yield
+    finally:
+        object.__setattr__(CONFIG, "gex", old)
 
 
 _CFG = ESLeadConfig(enabled=True, lookback_bars=3, atr_mult=2.0, min_pts=4.0,
@@ -115,7 +129,8 @@ def test_es_lead_quiet_without_arm() -> None:
 def test_regime_flip_outranks_es_lead() -> None:
     # Zero-Γ at 7350; prev below, cur above → a regime flip, which ranks first.
     st = _state(7348.0, 7352.0)
-    cand = detect_candidate(st, _gex(7352.0, zero_gamma=7350.0), es_arm=Direction.BULLISH)
+    with legacy_gex():
+        cand = detect_candidate(st, _gex(7352.0, zero_gamma=7350.0), es_arm=Direction.BULLISH)
     assert cand is not None and cand.trigger is TriggerType.REGIME_FLIP
 
 

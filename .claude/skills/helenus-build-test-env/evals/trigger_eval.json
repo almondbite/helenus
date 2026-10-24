@@ -1,0 +1,23 @@
+[
+  {"query": "ModuleNotFoundError: No module named 'helenus' when running tests", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "pytest says no module named pytest??", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "run all the test suites and tell me if they're green", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "how do i set up this repo on a fresh machine", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "should I activate the venv first?", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "test_sq9 wont run, import error", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "getting 401s from schwab at startup, token thing?", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "what env vars does the bot need", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "is this failure my code or the environment", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "quick syntax check on the files I touched", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "can I just pip install pytest to make this easier", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "how do I run test_conviction.py on powershell", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "python main.py to test my change, right?", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "the oauth browser flow - which script does that", "should_trigger": true, "expected_skill": "helenus-build-test-env"},
+  {"query": "a test assertion failed in test_gexmap, what does that mean", "should_trigger": false, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "the scalp tests pass so the 5m mode is validated right", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "why no candidates fired today", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "install numpy in my other project", "should_trigger": false, "expected_skill": null},
+  {"query": "what is scan2 for", "should_trigger": false, "expected_skill": "helenus-repo-orientation"},
+  {"query": "help me write a dockerfile for a flask app", "should_trigger": false, "expected_skill": null},
+  {"query": "replay the gate over the june 22 tape", "should_trigger": false, "expected_skill": "helenus-diagnostics-tooling"}
+]

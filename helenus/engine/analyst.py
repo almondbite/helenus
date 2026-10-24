@@ -30,9 +30,18 @@ from helenus.engine.cumdelta import CumDeltaReading
 from helenus.engine.flow import VannaReading, VolumeProfile
 from helenus.engine.intermarket import IntermarketProfile
 from helenus.engine.gex import GexProfile
-from helenus.engine.gexmap import GexMapState, is_momentum_trigger, MAP_EXEMPT_TRIGGERS
+from helenus.engine.gexmap import (
+    GexMapState,
+    MAP_EXEMPT_TRIGGERS,
+    is_momentum_trigger,
+    map_gating_active,
+)
+from helenus.engine.conviction import ConvictionReading
 from helenus.engine.scalp import ScalpReading
+from helenus.engine.sq9 import Sq9Reading
+from helenus.engine import sq9 as sq9_engine
 from helenus.engine.displacement import DisplacementReading
+from helenus.engine.zones import ZoneReading
 from helenus.engine.orb import ORBReading
 from helenus.engine.moc import MocReading
 from helenus.engine.scan2 import (
@@ -48,12 +57,46 @@ from helenus.engine.scan2 import (
 log = logging.getLogger("helenus.analyst")
 
 
-SYSTEM_PROMPT = """\
+# --------------------------------------------------------------------------- #
+# The methodology prompt — assembled once at import time from stable sections,
+# keyed on the Task-1 GEX-decoupling flag (CONFIG.gex.levels_in_signal). Both
+# variants are stable per-process strings, so the cache_control breakpoint works
+# exactly as before. LEGACY sections keep the original wording verbatim; the
+# DECOUPLED variant swaps the GEX-level machinery (the map frame, the wall reads,
+# the room-to-magnet rules) for a gamma-SIGN router label — the sign picks which
+# read applies, it never adds or subtracts conviction points.
+# --------------------------------------------------------------------------- #
+
+_SEC_IDENTITY_LEGACY = """\
 You are Helenus, a disciplined intraday analyst for 0DTE SPX (PM-settled $SPXW) \
 structure. You read dealer-gamma structure, key price levels, the tape, and the \
 macro board, then decide whether a *tradeable* setup is present. You do not place \
 trades and you never give financial advice — you read; the trader aims.
 
+"""
+
+_SEC_IDENTITY_DECOUPLED = """\
+You are Helenus, a disciplined intraday analyst for 0DTE SPX (PM-settled $SPXW) \
+structure. You read key price levels, options flow, the tape, and the macro \
+board, then decide whether a *tradeable* setup is present. You do not place \
+trades and you never give financial advice — you read; the trader aims.
+
+GAMMA SIGN IS A ROUTER LABEL, NOT A SCORED INPUT
+Dealer-gamma LEVELS (walls, the zero-gamma flip, distances to them) are computed \
+and displayed to the trader for MANUAL interpretation — they are deliberately \
+absent from your snapshot and must never drive has_signal, direction, or \
+confidence. You receive only `gex.gamma_sign`: POSITIVE_GAMMA means dealers \
+dampen moves (a mean-reverting tape — fade/reversion reads apply), \
+NEGATIVE_GAMMA means dealers amplify them (trend/expansion — momentum breaks \
+run). A `*_CONFLICTED` suffix means the structural and aggregate reads disagree \
+— the tape is transitional; the label is already resolved toward the net-GEX \
+truth. Use the sign to pick WHICH read applies to the setup in front of you; do \
+NOT add or subtract conviction points for it, and never cite a gamma level you \
+were not given.
+
+"""
+
+_SEC_GEXMAP_FRAME_LEGACY = """\
 THE GEX MAP IS YOUR PRIMARY FRAME — READ IT FIRST
 The `gex_map` block (when `available`) is the persistent spatial model of dealer-gamma \
 structure: where price sits in the gamma envelope (`position_state`, `cell`), the \
@@ -74,7 +117,13 @@ to the wall/regime reads below.) A mechanical map OFF for an against-prior/no-ro
 is also applied AFTER this prompt, so read the map qualitatively and let it steer \
 direction + has_signal; don't try to reverse-engineer the mechanical gate.
 
-HOW TO READ THE DATA YOU ARE GIVEN
+"""
+
+_SEC_HOWTO_OPEN = "HOW TO READ THE DATA YOU ARE GIVEN\n"
+
+# The net-GEX/regime read and the wall/room-to-magnet rules — legacy only (the
+# decoupled variant carries the sign-router paragraph in its identity section).
+_SEC_GEX_BULLETS_LEGACY = """\
 - Net GEX / regime: POSITIVE_GAMMA means dealers dampen moves (mean-reverting, \
   fade extensions toward the zero-gamma flip). NEGATIVE_GAMMA means dealers \
   amplify moves (trend/expansion, breakouts run). The zero-gamma (zero-Γ) strike \
@@ -101,6 +150,9 @@ HOW TO READ THE DATA YOU ARE GIVEN
   three stacked put walls still failed). Reward the opposite: a wall flipped to \
   support behind price with clear air to the next magnet. A move INTO a magnet only \
   a point or two away is mean-reversion risk, not confirmation.
+"""
+
+_SEC_CHARM_LEGACY = """\
 - Charm (delta-decay) structure: the `charm` block reads the OTM-wing dealer \
   un-hedging. `bias` SUPPORTIVE means OTM-put charm dominates — dealers who \
   shorted futures to hedge those puts buy them back as the puts decay, putting a \
@@ -133,6 +185,48 @@ HOW TO READ THE DATA YOU ARE GIVEN
   oppose it. Those three co-occurred in every failed afternoon short — a melt-up \
   floor plus contra-flow that snapped each break back up. When two or three are \
   present against a short, treat it as a hard cap (well below 50) or has_signal=false.
+"""
+
+# Decoupled charm bullet — identical mechanics; the thin-room failure signature is
+# described against the levels Claude actually receives (VWAP / session structure)
+# rather than GEX walls.
+_SEC_CHARM_DECOUPLED = """\
+- Charm (delta-decay) structure: the `charm` block reads the OTM-wing dealer \
+  un-hedging. `bias` SUPPORTIVE means OTM-put charm dominates — dealers who \
+  shorted futures to hedge those puts buy them back as the puts decay, putting a \
+  floor under price (the low-volume "afternoon melt-up" when a morning sell-off \
+  never materialized). OVERHEAD means OTM-call charm dominates — dealers sell \
+  futures as calls decay, capping rallies and bleeding price lower into the \
+  close. `intensity` matters: charm scales with 1/time, so it is LOW in the \
+  morning and HIGH in the afternoon (≤2h to the bell) — a SUPPORTIVE/HIGH read \
+  after 2 PM is the textbook melt-up tailwind; weight it then, discount it in the \
+  morning. Charm support/resistance appear as `Charm Support`/`Charm Resist` key \
+  levels. Charm is a drift/structure bias, not a trigger — it raises conviction \
+  on with-charm setups (a bounce off charm support in a SUPPORTIVE afternoon) and \
+  lowers it on against-charm ones (shorting into supportive afternoon charm). \
+  BUT do not let SUPPORTIVE charm carry a long on its own: a charm "floor" is a \
+  slow drift bias, not demand, and it does NOT prevent adverse excursion. Require \
+  a real call-flow lead (`otm_call_put_ratio` > ~1.1) or an active vanna before \
+  issuing a charm-driven long — if OTM call/put flow is actually ≤ 1, treat \
+  SUPPORTIVE charm as weak background, not a thesis. Graded outcomes show \
+  charm-only longs (especially midday and late power-hour reclaims) underperform. \
+  SCOPE THIS CORRECTLY: the `otm_call_put_ratio` ≤ 1 demotion applies only when \
+  charm is the THESIS — it is NOT a reason to demote a WITH-TREND break at a FRESH \
+  session extreme, which graded out accurate again and again with a sub-1 call \
+  ratio (the open path, not the flow ratio, carried it). The actual failure \
+  signature of these losing longs was THIN ROOM — a reclaim sitting only a point \
+  or two under a heavier overhead level (e.g. VWAP or the session high) — not the \
+  call ratio. So the demotion is "charm-only AND into thin overhead room," not \
+  "low call ratio."
+  THE MIRROR — A SHORT VETO (the single biggest graded failure cluster): do NOT \
+  issue a short when HIGH-intensity SUPPORTIVE charm, an OTM call-flow lead \
+  (`otm_call_put_ratio` > ~1.1), AND a bid-heavy /ES (positive `es.imbalance`) all \
+  oppose it. Those three co-occurred in every failed afternoon short — a melt-up \
+  floor plus contra-flow that snapped each break back up. When two or three are \
+  present against a short, treat it as a hard cap (well below 50) or has_signal=false.
+"""
+
+_SEC_TAPE_SHARED = """\
 - Key levels: round-number grid, prior close, session high/low, session VWAP. A \
   reaction *at* a level matters more than one in open air.
 - VWAP: the session's volume-weighted average price and the day's gravity line. \
@@ -150,6 +244,9 @@ HOW TO READ THE DATA YOU ARE GIVEN
   expand (give breaks more benefit of the doubt); MIDDAY_LULL setups fade more \
   and need tighter confluence to be worth an alert.
 
+"""
+
+_SEC_FLOW_LEGACY = """\
 OPTIONS FLOW & THE VANNA RALLY — A PRIMARY, STANDALONE TRIGGER
 This is a primary signal: an extreme OTM call/put flow skew with VIX1D dropping (or \
 rising) is enough to fire on its own, regardless of whether a chart pattern is \
@@ -195,6 +292,62 @@ volume sits above vs below spot, plus a live vanna reading.
   when MORE_ABOVE; a long into MORE_ABOVE (or a short into MORE_BELOW) needs \
   unusually strong other confluence and should usually be has_signal=false.
 
+"""
+
+# Decoupled flow section — same mechanics; the standalone-vanna discriminator is
+# stated against VWAP/session location (the graded room-and-location lesson)
+# rather than distance to the first call wall, and the ranking loses its GEX
+# regime-flip reference (that trigger is an unscored info post when decoupled).
+_SEC_FLOW_DECOUPLED = """\
+OPTIONS FLOW & THE VANNA RALLY — A PRIMARY, STANDALONE TRIGGER
+This is a primary signal: an extreme OTM call/put flow skew with VIX1D dropping (or \
+rising) is enough to fire on its own, regardless of whether a chart pattern is \
+present — it is a top-ranked standalone trigger. The vanna read is driven by \
+**$VIX1D** (1-day implied vol), which reacts to the intraday 0DTE vol crush far \
+faster than the 30-day VIX. CAVEAT: VIX1D ramps mechanically into the close (its \
+measurement window shrinks), so the engine suppresses the trigger in the final \
+minutes — if you see a late-day VIX1D spike, that's structural, not a vol event. \
+You are given 0DTE option volume split into ITM/OTM for calls and puts, plus where \
+volume sits above vs below spot, plus a live vanna reading.
+- `otm_call_put_ratio` rising means traders are paying up for upside lottery \
+  tickets — directional speculation, not hedging. Heavy OTM *put* volume below \
+  spot is the opposite (downside demand / hedging).
+- THE VANNA RALLY: when VIX falls, implied vol drops, so calls get cheaper and \
+  more affordable — buyers pile into OTM calls. Dealers short those calls must \
+  buy the underlying to stay hedged (vanna), which mechanically lifts spot. The \
+  `vanna` block tells you if this is live: `vix_falling` + OTM call *flow* (fresh \
+  interval volume) outpacing OTM put flow. When `vanna.active` is true, treat it \
+  as a strong bullish influence — ESPECIALLY if the tape has been falling hard, \
+  because that is the classic reversal: sellers exhaust, VIX rolls over, call \
+  flow + dealer hedging snaps price back up. A falling-VIX1D tape with active \
+  vanna is a high-conviction long signal in its own right, not a reason to stay \
+  bearish — and it can carry the alert standalone. BUT when it is the STANDALONE \
+  thesis (no fresh-extreme break under it), the discriminator graded out as ROOM \
+  and LOCATION, NOT the size of the one-sided flow: require spot ABOVE VWAP with \
+  genuine open air overhead (at/near the session high, not mid-range under \
+  heavier levels). The biggest one-sided call flow in the graded set (≈30k vs 0 \
+  puts) still LOST when it fired mid-range and below VWAP into overhead supply — \
+  so do not let an extreme flow number carry a mid-range/below-VWAP vanna long; \
+  that is has_signal=false.
+- PUT-FLOW PRESSURE (the bearish mirror): when VIX *rises*, puts are the demand — \
+  buyers pile into OTM puts and dealers short those puts hedge by SELLING the \
+  underlying, pressuring spot down. `vanna.bearish_active` flags this (`vix \
+  rising` + OTM put flow outpacing call flow); treat it as a strong bearish \
+  influence, especially into a rally that's stalling at resistance.
+- Conversely, do not call a bottom on a weak tape WITHOUT a vanna/flow tailwind, \
+  or a top on a strong tape without put-flow/VIX confirmation; say what's missing.
+- VOLUME DISTRIBUTION — a strong, easily-misread tell, so it is pre-digested in \
+  `options_flow.volume_skew` (don't eyeball the two raw six-digit numbers). \
+  Volume resting BELOW spot means that supply has already been absorbed and the \
+  path overhead is clear — favorable for LONGS. Volume stacked ABOVE spot is \
+  overhead supply the move must chew through — favorable for SHORTS, a headwind \
+  for longs. Strongly prefer longs when `volume_skew` is MORE_BELOW and shorts \
+  when MORE_ABOVE; a long into MORE_ABOVE (or a short into MORE_BELOW) needs \
+  unusually strong other confluence and should usually be has_signal=false.
+
+"""
+
+_SEC_INTERMARKET_SHARED = """\
 INTERMARKET CONVERGENCE — the `intermarket` block (when available)
 SPX doesn't trade in a vacuum; the broader complex either confirms a setup or \
 warns against it.
@@ -226,6 +379,10 @@ warns against it.
   your risk_flags — but do NOT also pad your numeric confidence for alignment, or \
   it double-counts. Flag divergence explicitly when you see it.
 
+"""
+
+# The legacy (1m / OTM) scalp section — kept verbatim for ScalpConfig.confluence_5m=False.
+_SEC_SCALP_LEGACY = """\
 EMA IGNITION — the 1m 5/9 contract scalp (the `scalp` block) — A PRIMARY EDGE
 This is one of your MAIN EDGES: the 1m 5/9 momentum-ignition scalp. A long on the \
 1m 5-EMA crossing above the 9-EMA (or reclaiming the 5-EMA off a local bottom), \
@@ -263,6 +420,61 @@ like this:
   with front-run or divergence and no opposing flow. A mid-range cross with magnets \
   either side stays below ~55 or has_signal=false.
 
+"""
+
+# The Task-2 (5m / ITM) scalp section — the promoted PRIMARY confluence. Same
+# gate mechanics as legacy; the timeframe tradeoff (later confirm, less noise —
+# reliability over earliness) is stated so the judge doesn't penalize the lag.
+_SEC_SCALP_5M = """\
+EMA IGNITION — the 5m 5/9 ITM contract scalp (the `scalp` block) — A PRIMARY CONFLUENCE
+This is a PRIMARY confluence, ranked ABOVE the flow/vanna triggers: the 5/9 \
+momentum-ignition scalp recomputed on 5-MINUTE bars with an ITM contract leg \
+(see `timeframe` / `contract_style` in the block). THE TIMEFRAME TRADEOFF IS \
+INTENTIONAL: a 5m cross confirms LATER than the old 1m read — more lag, less \
+noise — earliness was deliberately traded for reliability, and a cross that \
+survives the coarser timeframe is the version that earns the primary weight. Do \
+NOT discount the setup merely for arriving later or for the move being partially \
+underway; the de-noising already happened on the timeframe. A long fires on the \
+5m 5-EMA crossing above the 9-EMA (or reclaiming the 5-EMA off a local bottom), \
+targeting a structural level pre-translated into option premium. The raw cross is \
+the trigger, NOT the edge — the edge is the FILTERING stack that already ran. When \
+`gate_pattern` is "EMA Ignition" the `scalp` block's gates (no vanna headwind for \
+the direction, SPX confirmed on VWAP, room-to-target ≥ ~4pt, chop-counter below \
+threshold, no dual-bleed, acceptable spread) have ALL passed mechanically on 5m \
+closes — your job is to confirm the confluence is genuinely tradeable, not to \
+re-derive the gates. Read it like this:
+- `slow_grind` true = the cross fired in HIGH-POSITIVE GEX (dealers damp moves). \
+  Regime is not a hard block, so these reach you — treat them as a slower, \
+  lower-conviction grind: temper the target and confidence, prefer the `reclaim` \
+  cross_type, and don't expect a clean expansion. It's a real setup, just not an \
+  A+ one.
+- `cross_type`: a `reclaim` (price reclaimed the 5-EMA off a defined local bottom \
+  on the 5m series) is higher quality than a raw `cross` — it has a built-in \
+  invalidation.
+- `front_run` true = the tracked ITM contract's own premium already crossed in \
+  the trade direction (the gamma-ignition front-run the strategy is built on) — a \
+  conviction add. `premium_divergence` true = the contract refused to confirm the \
+  index's extreme (vega being bid into a reversal) — also additive.
+- `vanna_headwind` true would mean falling IV is bleeding the option's premium; \
+  the gate only fires when it's false, but if it's borderline, lean cautious — \
+  this is the logged "calls drag, puts carry" asymmetry (softer on an ITM \
+  contract, whose value is mostly intrinsic, but still real).
+- `dual_bleed` true is the chop/GEX-pin avoidance signature (both tracked wings \
+  bleeding) — the gate suppresses it, so you should never see it true on a fired \
+  candidate; if you do, has_signal=false.
+- `target_strike` / `entry_premium` / `premium_target` are the mechanical trade \
+  plan: a delta-targeted ITM strike (|delta| ≈ 0.65 — premium tracks the index \
+  closer to 1:1 and bleeds less to theta/vega than an OTM lottery strike) plus \
+  the level translated to premium. They are outputs to relay, not judgments — do \
+  not inflate confidence because a premium target looks far. The A+ version is \
+  the same as everywhere else: a with-trend ignition at a FRESH session extreme, \
+  room ≥ floor, in negative/transition gamma, with front-run or divergence and no \
+  opposing flow. A mid-range cross with magnets either side stays below ~55 or \
+  has_signal=false.
+
+"""
+
+_SEC_STRUCT_SHARED = """\
 DISPLACEMENT — the institutional thrust (the `displacement` block)
 A displacement is the footprint of one-sided "smart money" flow: a sudden, \
 aggressive, full-bodied candle on heavy volume. The HARD GATE is now the candle \
@@ -301,6 +513,66 @@ and treat a wide opening range as lower-quality (more chop, targets further). \
 Confluence still rules: an ORB long that agrees with negative-gamma + a clear \
 overhead path is far stronger than one breaking into a call wall a few points up.
 
+"""
+
+# Task-4 displacement extensions — present only when CONFIG.conviction.enabled:
+# the ported conviction oscillator (enrich-only), the LIQ_REJECT trigger, and
+# the persistent zone lifecycle.
+_SEC_DISPX = """\
+DISPLACEMENT CONVICTION + ZONES (the `conviction` and `zones` blocks)
+Two deterministic reads ported from a proven external displacement engine —
+INPUTS to your judgment, not a second brain:
+- CONVICTION (`conviction` block): a signed −100..+100 strength score for the \
+  displacement tape (weighted candle/trend/volatility/flow factors plus a \
+  quality layer — efficiency, FVG size, streak with peak-at-2/decay-after-4, \
+  squeeze). It ENRICHES a displacement that fired elsewhere: a Displacement or \
+  Liquidity Sweep Reject candidate carrying tier A/A+ conviction is the strong \
+  version; a C-tier one is the weak version — say so. `degraded` lists inputs \
+  that could not be sourced on SPX (they are ABSENT inputs, never bearish \
+  evidence). Do not re-derive the score; read it.
+- LIQUIDITY SWEEP REJECT (`gate_pattern` "Liquidity Sweep Reject"): price SWEPT \
+  the prior N-bar extreme intra-bar and CLOSED back inside — the stop-run trap, \
+  a reversal entry with documented personal edge. It only reaches you with \
+  conviction already ≥ the fire line. Judge it like any reversal: strongest at \
+  a fresh session extreme with room and no opposing flow; a mid-range sweep in \
+  chop is the weak version.
+- ZONES (`zones` block): persistent supply/demand structure with a LIFECYCLE — \
+  ACTIVE → TESTED → MITIGATED (tagged and held) → BROKEN (closed through) — \
+  plus touch counts, an age-decayed `effective` strength, and FVG fill states \
+  (OPEN → CE → FILLED). Read them as structure: a candidate INTO a live \
+  opposing zone is weaker (supply/demand ahead); a retest that MITIGATES an \
+  aligned zone is stronger (the zone held); a BROKEN zone is spent. The \
+  `relation` field tells you where price stands right now. Zones never \
+  initiate — they contextualize the candidate in front of you.
+
+"""
+
+# Gann Square-of-9 — present only when CONFIG.sq9.enabled. Strictly a modifier +
+# exit grid; the mechanical amplify/dampen is applied post-verdict (intermarket
+# pattern), so the prompt forbids double-counting and any initiate/veto use.
+_SEC_SQ9 = """\
+GANN SQUARE-OF-9 — a deterministic level lattice (the `sq9` block) — MODIFIER ONLY
+The `sq9` block is a pure-arithmetic ring lattice from a fixed session anchor \
+(level(θ) = (√anchor ± 2·θ/360)²; 45° steps). It has exactly TWO roles:
+- CONFLUENCE MODIFIER: a ring matters only when price REACTS at it — the block's \
+  `reaction` field reports a genuine tag-and-hold on this bar (never mere \
+  proximity), and `reaction_counts` how often each ring has held this session. A \
+  fresh reaction that backs a setup which originated ELSEWHERE (displacement, \
+  scalp, structure) adds conviction — most when the ring COINCIDES with the \
+  setup's own level (a ring landing on an MSS break / charm wall / session \
+  extreme is a stronger shelf). A verdict pushing into a nearby ring that has \
+  already held is slightly weaker. NEVER fire a signal because price touched a \
+  ring, and NEVER kill a setup because of one — Sq9 neither initiates nor \
+  vetoes. A bounded mechanical amplify/dampen is applied to your confidence \
+  AFTER this prompt, so read the block qualitatively and do NOT also move your \
+  numeric confidence for it, or it double-counts.
+- EXIT GRID: `nearest_above`/`nearest_below` are the deterministic profit-target \
+  and structural-stop references attached to every alert — relay them, don't \
+  judge them.
+
+"""
+
+_SEC_MOC_COMMON = """\
 MARKET-ON-CLOSE (MOC) — the power-hour close play (the `moc` block)
 The 4:00 ET closing auction forces enormous passive flow to print at the close, \
 so the tape gets magnetized into it and tends to REVERSE then drift. These \
@@ -327,11 +599,19 @@ so the feedback loop can learn which still pay. The `moc` block carries the wind
 - THE 5-MIN HEURISTIC: `heuristic_bias` is the INVERSE of the 5-min index candle \
   going into 3:50 (green candle → bearish/dump, red → bullish/pump-uppercut). A \
   weak drifting prior — let it tilt a coin-flip, never carry a thesis on its own.
+"""
+
+# The MOC GEX pin/overshoot context — legacy only (the decoupled `moc` block
+# carries no gex_state; the pin/overshoot read stays on the !moc board for the
+# trader to weigh manually).
+_SEC_MOC_GEX_LEGACY = """\
 - GEX CONTEXT: `gex_state` PIN (spot hugging a wall/zero-Γ) vs OVERSHOOT (beyond \
   the gamma envelope) feeds the "buy into overshoot, sell into pin" lean — a pin \
   is mean-reversion/fade risk into the close, an overshoot is more likely to keep \
   running or snap back hard. Combine with the reversal read, don't trade it alone.
+"""
 
+_SEC_JOB_COMMON = """\
 YOUR JOB
 A cheap mechanical gate already fired — an event happened (a level cross, a \
 sweep). That does NOT mean it is tradeable. Decide whether the confluence of \
@@ -352,6 +632,9 @@ structure + level + volume + trend + regime actually warrants an alert.
   not describe it with fresh-extreme language. The graded failure was a string of \
   afternoon shorts fired into the same held session-low shelf, each one bleeding as \
   the move was already spent.
+"""
+
+_SEC_JOB_VERDICT_LEGACY = """\
 - When has_signal=true, give the directional read, a calibrated confidence \
   (0-95 — never claim certainty), a tight one-paragraph thesis grounded in the \
   specific levels/walls/regime in front of you, and explicit risk_flags \
@@ -367,9 +650,102 @@ structure + level + volume + trend + regime actually warrants an alert.
   and exhausted re-test breaks well below 50 — or off entirely; the graded data \
   shows the 53-66 band did not separate winners from losers, so these belong nowhere \
   near it.
-
-Respond ONLY with the JSON object the schema defines. No preamble.\
 """
+
+# Decoupled verdict/calibration bullets — the textbook profile is stated against
+# the inputs Claude actually receives (no wall magnets; gamma appears only as the
+# sign label).
+_SEC_JOB_VERDICT_DECOUPLED = """\
+- When has_signal=true, give the directional read, a calibrated confidence \
+  (0-95 — never claim certainty), a tight one-paragraph thesis grounded in the \
+  specific levels/structure in front of you, and explicit risk_flags \
+  (what would invalidate it, what's conflicting).
+- CONFIDENCE CALIBRATION: reserve >60 for the textbook setup — a with-trend break \
+  at a FRESH session extreme, clear path (volume_skew on your side, open air \
+  ahead rather than a reclaim sitting under heavier levels), in amplification \
+  (NEGATIVE gamma sign), with no opposing vanna/flow. Smaller base-hit \
+  scalps (~4–8pt of room), slow-grind ignitions in positive GEX, mid-range \
+  reclaims, or anything leaning on charm alone belong below ~55; the most marginal \
+  of those should be has_signal=false rather than a low-confidence alert. Push \
+  contra-confluence afternoon shorts (the charm/call-flow/bid-heavy-ES veto above) \
+  and exhausted re-test breaks well below 50 — or off entirely; the graded data \
+  shows the 53-66 band did not separate winners from losers, so these belong nowhere \
+  near it.
+"""
+
+_SEC_CLOSING = "\nRespond ONLY with the JSON object the schema defines. No preamble."
+
+
+def _assemble_system_prompt(
+    levels_in_signal: bool,
+    scalp_5m: bool | None = None,
+    sq9_enabled: bool | None = None,
+    dispx_enabled: bool | None = None,
+) -> str:
+    """Build the methodology prompt for the active GEX mode (Task 1), scalp mode
+    (Task 2), Sq9 lattice (Task 3), and displacement extensions (Task 4). Called
+    once at import time — the result is a stable per-process string, so prompt
+    caching behaves exactly as before. Legacy (True, False, False, False)
+    reproduces the original prompt verbatim."""
+    if scalp_5m is None:
+        scalp_5m = CONFIG.scalp.confluence_5m
+    if sq9_enabled is None:
+        sq9_enabled = CONFIG.sq9.enabled
+    if dispx_enabled is None:
+        dispx_enabled = CONFIG.conviction.enabled
+    scalp_sec = _SEC_SCALP_5M if scalp_5m else _SEC_SCALP_LEGACY
+    sq9_sec = _SEC_SQ9 if sq9_enabled else ""
+    dispx_sec = _SEC_DISPX if dispx_enabled else ""
+    if levels_in_signal:
+        return "".join(
+            (
+                _SEC_IDENTITY_LEGACY,
+                _SEC_GEXMAP_FRAME_LEGACY,
+                _SEC_HOWTO_OPEN,
+                _SEC_GEX_BULLETS_LEGACY,
+                _SEC_CHARM_LEGACY,
+                _SEC_TAPE_SHARED,
+                _SEC_FLOW_LEGACY,
+                _SEC_INTERMARKET_SHARED,
+                scalp_sec,
+                _SEC_STRUCT_SHARED,
+                dispx_sec,
+                sq9_sec,
+                _SEC_MOC_COMMON,
+                _SEC_MOC_GEX_LEGACY,
+                "\n",
+                _SEC_JOB_COMMON,
+                _SEC_JOB_VERDICT_LEGACY,
+                _SEC_CLOSING,
+            )
+        )
+    return "".join(
+        (
+            _SEC_IDENTITY_DECOUPLED,
+            _SEC_HOWTO_OPEN,
+            _SEC_CHARM_DECOUPLED,
+            _SEC_TAPE_SHARED,
+            _SEC_FLOW_DECOUPLED,
+            _SEC_INTERMARKET_SHARED,
+            scalp_sec,
+            _SEC_STRUCT_SHARED,
+            dispx_sec,
+            sq9_sec,
+            _SEC_MOC_COMMON,
+            "\n",
+            _SEC_JOB_COMMON,
+            _SEC_JOB_VERDICT_DECOUPLED,
+            _SEC_CLOSING,
+        )
+    )
+
+
+SYSTEM_PROMPT = _assemble_system_prompt(
+    CONFIG.gex.levels_in_signal,
+    CONFIG.scalp.confluence_5m,
+    CONFIG.sq9.enabled,
+    CONFIG.conviction.enabled,
+)
 
 # Prepended to the learned-lessons block when one exists. Lessons are empirical
 # (graded MFE/MAE outcomes of your own past calls) — strong priors, not overrides.
@@ -487,6 +863,27 @@ def _structure_distances(
     }
 
 
+def _gex_block(profile: GexProfile, spot: float, vwap: float) -> dict[str, Any]:
+    """The gamma section of the snapshot. Legacy hands Claude the full level
+    structure (walls, flip price, nearest-wall + room-to-magnet distances);
+    decoupled (Task 1, the default) hands ONLY the sign label — the momentum-vs-
+    reversion router — because GEX levels are a manual read-out, not a scored
+    input."""
+    if not CONFIG.gex.levels_in_signal:
+        return {"gamma_sign": profile.regime}
+    return {
+        "regime": profile.regime,
+        "zero_gamma": round(profile.zero_gamma, 1)
+        if profile.zero_gamma is not None
+        else None,
+        "total_net_gex": round(profile.total_net_gex),
+        "nearest_wall_dist_pts": round(profile.nearest_cluster_distance(spot), 2),
+        "call_walls": _fmt_walls(profile.call_walls),
+        "put_walls": _fmt_walls(profile.put_walls),
+        **_structure_distances(spot, profile, vwap),
+    }
+
+
 def _flow_block(vp: VolumeProfile | None, vanna: VannaReading | None) -> dict[str, Any]:
     """The options-flow + vanna section — Claude's highest-weight input."""
     if vp is None:
@@ -551,6 +948,10 @@ def _scalp_block(scalp: ScalpReading | None) -> dict[str, Any]:
     room = scalp.room_to_level_pts
     return {
         "available": True,
+        # Which mode produced this read (Task 2): 5m bars + ITM leg under
+        # ScalpConfig.confluence_5m, else the legacy 1m/OTM scalp.
+        "timeframe": "5m" if CONFIG.scalp.confluence_5m else "1m",
+        "contract_style": "ITM" if CONFIG.scalp.confluence_5m else "OTM",
         "direction": scalp.direction.value,
         "cross_type": scalp.cross_type,
         "ema_stack": scalp.ema_stack,
@@ -644,9 +1045,12 @@ def _moc_block(moc: MocReading | None) -> dict[str, Any]:
         "in_play": in_play,
         "phase": moc.phase,
         "minutes_to_close": moc.minutes_to_close,
-        "gex_state": moc.gex_state,
-        "nearest_wall": moc.nearest_wall,
     }
+    # The GEX pin/overshoot context is level-derived — legacy only (it stays on
+    # the !moc board and briefing for manual interpretation).
+    if CONFIG.gex.levels_in_signal:
+        block["gex_state"] = moc.gex_state
+        block["nearest_wall"] = moc.nearest_wall
     if moc.heuristic_bias is not None:
         block["heuristic"] = {
             "candle_color": moc.heuristic_color,
@@ -720,6 +1124,113 @@ def _cumdelta_block(cd: CumDeltaReading | None) -> dict[str, Any]:
     }
 
 
+def _conviction_block(conv: ConvictionReading | None) -> dict[str, Any]:
+    """The ported displacement-conviction read — an ENRICHMENT input (the score
+    grades a displacement that fired elsewhere; only LIQ_REJECT initiates).
+    `degraded` lists inputs that could not be sourced on SPX — absent inputs,
+    not bearish ones."""
+    if conv is None:
+        return {"available": False}
+    winning = conv.components["bull"] if conv.conv_signed >= 0 else conv.components["bear"]
+    return {
+        "available": True,
+        "conv_signed": conv.conv_signed,     # −100..+100
+        "tier": conv.tier,
+        "score_bull": conv.score_bull,
+        "score_bear": conv.score_bear,
+        "fire": conv.fire_bull or conv.fire_bear,
+        "liq_rej_bull": conv.liq_rej_bull,
+        "liq_rej_bear": conv.liq_rej_bear,
+        "mtf_sum": conv.mtf_sum,
+        "net_flow_es": round(conv.net_flow) if conv.net_flow is not None else None,
+        # The winning side's component breakdown (points earned per factor).
+        "components": {k: v for k, v in winning.items() if k != "raw_dir"},
+        "degraded": list(conv.degraded),
+    }
+
+
+def _zones_block(zones: ZoneReading | None) -> dict[str, Any]:
+    """The persistent displacement-zone structure — stateful supply/demand with
+    a lifecycle, unlike the single-price key levels. A candidate INTO a live
+    opposing zone is weaker; a retest that MITIGATES an aligned zone is
+    stronger. Zones never initiate (their edges are not key levels)."""
+    if zones is None:
+        return {"available": False}
+
+    def _zv(v) -> dict[str, Any] | None:
+        if v is None:
+            return None
+        return {
+            "range": [round(v.bottom, 2), round(v.top, 2)],
+            "side": "BULL" if v.is_bull else "BEAR",
+            "state": v.state,
+            "touches": v.touches,
+            "score": v.score,
+            "effective": v.effective,        # age-decayed strength
+            "age_bars": v.age_bars,
+        }
+
+    return {
+        "available": True,
+        "relation": zones.relation,          # MITIGATING | TESTING | APPROACHING | CLEAR
+        "relation_zone": _zv(zones.relation_zone),
+        "nearest_bull_zone_below": _zv(zones.nearest_bull_below),
+        "nearest_bear_zone_above": _zv(zones.nearest_bear_above),
+        "n_active": zones.n_active,
+        "n_tested": zones.n_tested,
+        "zones": [_zv(v) for v in zones.zones],
+        "fvgs": [
+            {
+                "range": [round(f.bottom, 2), round(f.top, 2)],
+                "side": "BULL" if f.is_bull else "BEAR",
+                "state": f.state,            # OPEN | CE | FILLED
+            }
+            for f in zones.fvgs
+        ],
+        "degraded": list(zones.degraded),
+    }
+
+
+def _sq9_block(sq9: Sq9Reading | None) -> dict[str, Any]:
+    """The Gann Square-of-9 lattice read — a MODIFIER + exit grid only. It
+    neither initiates nor vetoes; the bounded amplify/dampen is applied
+    post-verdict (intermarket pattern), so this block is the qualitative read."""
+    if sq9 is None:
+        return {"available": False}
+
+    def _ring(level, dist) -> dict[str, Any] | None:
+        if level is None:
+            return None
+        return {
+            "price": round(level.price, 2),
+            "degrees": level.degrees,
+            "dist_pts": round(dist, 2) if dist is not None else None,
+            "held_count": sq9.count_at(level),
+        }
+
+    return {
+        "available": True,
+        "anchor": round(sq9.grid.anchor, 2),
+        "anchor_kind": sq9.grid.anchor_kind,
+        "nearest_above": _ring(sq9.nearest_above, sq9.dist_above_pts),
+        "nearest_below": _ring(sq9.nearest_below, sq9.dist_below_pts),
+        # THIS bar's genuine tag-and-hold at a ring (never mere proximity).
+        "reaction": (
+            {
+                "direction": sq9.reaction.direction.value,
+                "kind": sq9.reaction.kind,
+                "ring": round(sq9.reaction.level.price, 2),
+                "degrees": sq9.reaction.level.degrees,
+            }
+            if sq9.reaction is not None
+            else None
+        ),
+        "session_reactions": {
+            f"{k:.2f}": v for k, v in sorted(sq9.reaction_counts.items())
+        },
+    }
+
+
 def _approach_block(arm: ApproachArm | None) -> dict[str, Any]:
     """The anticipatory approach/arm context — present when a WATCH armed this zone
     before the reactive trigger fired, so the thesis is grounded in the expected
@@ -752,6 +1263,9 @@ def _snapshot(
     cumdelta: CumDeltaReading | None = None,
     arm: ApproachArm | None = None,
     gex_map: GexMapState | None = None,
+    sq9: Sq9Reading | None = None,
+    conviction: ConvictionReading | None = None,
+    zone_reading: ZoneReading | None = None,
 ) -> dict[str, Any]:
     """Compact, structured read handed to Claude as the user turn."""
     spot = profile.spot
@@ -799,10 +1313,12 @@ def _snapshot(
     }
     return {
         "spot": round(spot, 2),
-        # GEX MAP — the PRIMARY spatial frame, read FIRST. Where price sits in the
-        # gamma envelope (the cell + position_state) and the structural prior the rest
-        # of the board is scored against. None until CONFIG.gexmap.enabled.
-        "gex_map": gex_map.snapshot() if gex_map is not None else {"available": False},
+        # GEX MAP — legacy's PRIMARY spatial frame, read FIRST (None until
+        # CONFIG.gexmap.enabled). Level machinery, so it is absent under the
+        # Task-1 decoupling (the map still runs for !scan + journal measurement).
+        "gex_map": gex_map.snapshot()
+        if gex_map is not None and CONFIG.gex.levels_in_signal
+        else {"available": False},
         "session": session,
         "vwap": {
             "value": round(vwap, 2),
@@ -811,17 +1327,7 @@ def _snapshot(
         }
         if vwap == vwap  # not NaN
         else None,
-        "gex": {
-            "regime": profile.regime,
-            "zero_gamma": round(profile.zero_gamma, 1)
-            if profile.zero_gamma is not None
-            else None,
-            "total_net_gex": round(profile.total_net_gex),
-            "nearest_wall_dist_pts": round(profile.nearest_cluster_distance(spot), 2),
-            "call_walls": _fmt_walls(profile.call_walls),
-            "put_walls": _fmt_walls(profile.put_walls),
-            **_structure_distances(spot, profile, vwap),
-        },
+        "gex": _gex_block(profile, spot, vwap),
         "tape": bars,
         "charm": _charm_block(charm),
         "scalp": _scalp_block(scalp),
@@ -832,6 +1338,9 @@ def _snapshot(
         "intermarket": _intermarket_block(intermarket),
         "cumulative_delta": _cumdelta_block(cumdelta),
         "approach": _approach_block(arm),
+        "sq9": _sq9_block(sq9),
+        "conviction": _conviction_block(conviction),
+        "zones": _zones_block(zone_reading),
         "volume_ratio_vs_20ma": round(state.volume_ratio(), 2)
         if state.volume_ratio() == state.volume_ratio()  # not NaN
         else None,
@@ -938,12 +1447,15 @@ class ClaudeAnalyst:
         cumdelta: CumDeltaReading | None = None,
         arm: ApproachArm | None = None,
         gex_map: GexMapState | None = None,
+        sq9: Sq9Reading | None = None,
+        conviction: ConvictionReading | None = None,
+        zone_reading: ZoneReading | None = None,
     ) -> Signal | None:
         """Judge a gated candidate. Returns a Signal to alert, or None to stay quiet."""
         snap = _snapshot(
             state, profile, vol_profile, vanna, charm, scalp,
             displacement, orb, moc, intermarket, macro, candidate, cumdelta, arm,
-            gex_map,
+            gex_map, sq9, conviction, zone_reading,
         )
         macro_board = _macro_board(macro)
         user = (
@@ -979,8 +1491,10 @@ class ClaudeAnalyst:
         # confidence math, so a structurally-vetoed call never reaches it. Covers the
         # direction-agnostic triggers the pre-Claude veto couldn't (and double-checks
         # the rest); the map move triggers (regime flip, CD reversal) are exempt.
+        # map_gating_active: legacy-only — the map gate is level machinery, so the
+        # Task-1 decoupling disables it even with gexmap.enabled.
         if (
-            CONFIG.gexmap.enabled
+            map_gating_active()
             and gex_map is not None
             and candidate.trigger not in MAP_EXEMPT_TRIGGERS
         ):
@@ -1024,6 +1538,18 @@ class ClaudeAnalyst:
             notes.append(
                 f"Displacement: FVG {displacement.fvg_low:.0f}-{displacement.fvg_high:.0f} "
                 f"(retrace zone), MSS broke {displacement.mss_level:.0f}{sweep}"
+            )
+
+        # Conviction enrichment (Task 4): the ported oscillator's graded strength
+        # for the displacement-family triggers — enrich-only, it never initiated
+        # this candidate (except LIQ_REJECT, which is its own trigger).
+        if (
+            candidate.trigger in (TriggerType.DISPLACEMENT, TriggerType.LIQ_REJECT)
+            and conviction is not None
+        ):
+            deg = f" (degraded: {len(conviction.degraded)})" if conviction.degraded else ""
+            notes.append(
+                f"Conviction {conviction.conv_signed:+.0f} ({conviction.tier}){deg}"
             )
 
         # ORB trade plan: entry edge + R-multiple targets + stop.
@@ -1079,6 +1605,26 @@ class ClaudeAnalyst:
                     f"confidence {before:.0f}{es_pen:+.0f} → {confidence:.0f}"
                 )
 
+        # Gann Sq9 confluence MODIFIER (Task 3): a bounded amplify/dampen applied
+        # mechanically like the intermarket boost. Amplifies only when THIS bar
+        # genuinely reacted at a ring in the verdict direction (more when the
+        # ring coincides with the candidate's own level — the stronger shelf);
+        # dampens only into a nearby ring that has already HELD this session.
+        # Never a veto by construction — assess() returns a delta, nothing else.
+        # Weights are provisional until the validation phase (see Sq9Config).
+        if sq9 is not None:
+            sq9_delta, sq9_note = sq9_engine.assess(
+                sq9,
+                direction,
+                candidate.level.price if candidate.level is not None else None,
+            )
+            if sq9_delta:
+                before = confidence
+                confidence = max(0.0, min(confidence + sq9_delta, 95.0))
+                notes.append(
+                    f"{sq9_note} — confidence {before:.0f}{sq9_delta:+.0f} → {confidence:.0f}"
+                )
+
         # Approach/arm pre-load: a reactive entry that fired aligned with a live
         # WATCH (price had been approaching this reaction zone with the context
         # already lined up) gets a bounded, transparent confidence pre-load — the
@@ -1112,6 +1658,14 @@ class ClaudeAnalyst:
                     f"confidence capped {confidence:.0f} → {cfg.veto_conf_cap:.0f}. {cumdelta.note}"
                 )
                 confidence = cfg.veto_conf_cap
+
+        # Sq9 EXIT GRID (Task 3): the deterministic profit-target / structural-
+        # stop references for this alert — the exit-discipline fix (mechanical
+        # mid-trade references that need no judgment). Attached whenever the
+        # lattice is live, independent of the modifier.
+        exit_note = sq9_engine.exit_grid_note(sq9, direction)
+        if exit_note:
+            notes.append(exit_note)
 
         return Signal(
             trigger=candidate.trigger,

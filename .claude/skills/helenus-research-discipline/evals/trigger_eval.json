@@ -1,0 +1,23 @@
+[
+  {"query": "the replay looks great, the new trigger is validated", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "ema ignition has a 62% win rate, should we weight it up", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "tests pass so the 5m scalp works, right?", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "I tried a few thresholds and 0.45 backtests best", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "this paper says gamma pinning predicts reversion, let's implement and enable it", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "is 29 graded alerts enough to finalize the sq9 weight", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "avg MFE is 12pts, this thing prints money", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "how should I evaluate whether the zone filter actually helps", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "hit rate dropped after we made entries earlier, revert?", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "can we call the conviction score proven now", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "make this filter a hard veto, the numbers support it", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "pool all the confluences together, the combined expectancy is positive", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "what evidence tier is a replay run", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "tune gate_volume_ratio in prod this afternoon and watch", "should_trigger": true, "expected_skill": "helenus-research-discipline"},
+  {"query": "did we already rule on ES imbalance vetoes", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "walk me through the validation phase tasks", "should_trigger": false, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "how do I run replay_gate", "should_trigger": false, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "what does MFE stand for", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "check my regex", "should_trigger": false, "expected_skill": null},
+  {"query": "new idea: a gap-fill trigger, how do we take it from idea to live", "should_trigger": false, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "what's the p-value convention in academic finance", "should_trigger": false, "expected_skill": null}
+]

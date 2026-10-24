@@ -1,0 +1,23 @@
+[
+  {"query": "what should we work on after the validation phase", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "could we bolt an ML model onto the journal data", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "what are the open problems in this project", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "ideas to make the bot meaningfully better?", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "can we fix the 15s spx tape staleness somehow", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "the confidence numbers are useless, whats the ambitious fix", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "how do we ever get enough data given dozens of alerts a session", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "should we build the scalp exit signals now that streaming exists", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "what would 'beyond state of the art' look like for helenus", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "persist vix history and in-flight grades across restarts?", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "can lessons decay-check themselves as data grows", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "train a classifier on the 29 alerts to predict winners", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "long term roadmap brainstorm for the bot", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "what's the process to take a frontier idea into code", "should_trigger": false, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "finish validating the rework first?", "should_trigger": false, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "did we try confidence-based sizing before", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "whats trending in AI research this month", "should_trigger": false, "expected_skill": null},
+  {"query": "auto-execute the trades through schwab", "should_trigger": true, "expected_skill": "helenus-research-frontier"},
+  {"query": "improve this function's readability", "should_trigger": false, "expected_skill": null},
+  {"query": "why is the spx tape poll based", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "startup idea validation frameworks?", "should_trigger": false, "expected_skill": null}
+]

@@ -65,6 +65,15 @@ def is_momentum_trigger(trigger: TriggerType) -> bool:
     return trigger in MOMENTUM_TRIGGERS
 
 
+def map_gating_active() -> bool:
+    """May the map gate/veto candidates? Both call sites — the pre-Claude veto
+    (bot._map_vetoes) and the post-verdict OFF (analyst.analyze) — consult this.
+    The map's prior/gate is LEVEL machinery, so under the Task-1 GEX decoupling
+    (gex.levels_in_signal False) it never gates even with gexmap.enabled — the
+    map then only serves display (!scan) and journal measurement."""
+    return CONFIG.gex.levels_in_signal and CONFIG.gexmap.enabled
+
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #

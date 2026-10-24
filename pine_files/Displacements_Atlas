@@ -1,0 +1,717 @@
+//@version=6
+// =============================================================================
+//  DISPLACEMENT ZONES  [Volatility Engine]  v6.0  —  Slayer Terminal
+// =============================================================================
+//  WHAT THIS IS (read this before selling it to anyone):
+//    Price-action displacement detector + supply/demand zone engine, overlaid
+//    with a REALIZED-volatility regime layer and a Volatility Risk Premium read.
+//
+//  WHAT IT IS NOT:
+//    It does NOT know the charted symbol's implied volatility or per-strike
+//    dealer flow — that is impossible inside Pine. The "vol index" (VIX/VXN/RVX)
+//    is a MARKET-REGIME gauge, not the instrument's IV. VRP is only meaningful
+//    when the chosen index actually matches the instrument (toggle below).
+//
+//  CHANGES vs v5.0:
+//    - RV is labeled RV (no more calling HV "IV"). Added Parkinson + Garman-Klass
+//      estimators (full-OHLC, more efficient than close-to-close).
+//    - Vol index is a free input.symbol(), explicitly a regime gauge.
+//    - Volatility Risk Premium (index − daily RV), gated on index-matches-symbol.
+//    - Transparent scoring: 8 components, weights sum to exactly 100, all bounded.
+//    - Multi-timeframe displacement confluence.
+//    - Zone lifecycle: ACTIVE -> TESTED -> MITIGATED / BROKEN, touch count, age decay.
+//    - FVG fill tracking: open -> CE(50%) -> filled.
+//    - Projected trade levels (entry / stop / TP1 / TP2) for high-score zones.
+//    - Slayer brand theme + automation-ready JSON alert payload.
+//
+//  All thresholds/weights are UNCALIBRATED defaults. Treat as placeholders.
+//  Not financial advice.
+// =============================================================================
+
+indicator("Displacement Zones [Volatility Engine] v6.0", overlay=true,
+     max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ---------------------------------------------------------------------------
+//  SCORE WEIGHTS  (sum = 100, each component normalized 0..1)
+// ---------------------------------------------------------------------------
+const float W_BODY   = 18.0
+const float W_ATR    = 18.0
+const float W_CLOSE  = 12.0
+const float W_STRUCT = 12.0
+const float W_VOL    = 10.0
+const float W_REGIME = 12.0
+const float W_MTF    = 10.0
+const float W_VRP    =  8.0
+
+const int STATE_ACTIVE = 0
+const int STATE_TEST   = 1
+const int STATE_MIT    = 2   // mitigated (reacted off zone, still valid)
+const int STATE_BROKEN = 3
+
+const int FVG_OPEN   = 0
+const int FVG_CE     = 1     // consequent encroachment (50% filled)
+const int FVG_FILLED = 2
+
+// ---------------------------------------------------------------------------
+//  INPUTS — CORE
+// ---------------------------------------------------------------------------
+length      = input.int(20,   "Lookback Length",        group="Core", minval=5, maxval=200)
+bodyMult    = input.float(1.2,"Body Multiplier (x avg)",group="Core", minval=0.5, maxval=6.0, step=0.1)
+atrMult     = input.float(1.2,"ATR Expansion (x ATR)",  group="Core", minval=0.5, maxval=6.0, step=0.1)
+closeThresh = input.float(0.55,"Close Conviction Threshold",group="Core", minval=0.30, maxval=1.0, step=0.05)
+confirmBar  = input.bool(true,"Confirm on Bar Close",   group="Core", tooltip="Signals fire only after the bar closes. Off = intrabar (will repaint).")
+
+// STRUCTURE
+swingLen   = input.int(3,"Swing Pivot Length", group="Structure", minval=2, maxval=50)
+useStruct  = input.bool(false,"Require Structure Break", group="Structure")
+structMode = input.string("Fast (1-bar)","Structure Mode", group="Structure", options=["Fast (1-bar)","Fractal (3-bar)","Confirmed (pivot)"])
+
+// VOLUME
+volMult = input.float(1.3,"Volume Multiplier (x avg)", group="Volume", minval=1.0, maxval=6.0, step=0.1)
+useVol  = input.bool(false,"Require Volume Filter", group="Volume")
+
+// REALIZED VOLATILITY
+rvEstimator = input.string("Garman-Klass","RV Estimator", group="Realized Volatility", options=["Close-to-Close","Parkinson","Garman-Klass"], tooltip="Parkinson/GK use the full OHLC range and are statistically more efficient than close-to-close.")
+rvLen       = input.int(20,"RV Lookback (bars)", group="Realized Volatility", minval=5, maxval=252)
+showEM      = input.bool(true,"Show 1-sigma Expected Move Band", group="Realized Volatility")
+
+// VOL INDEX + REGIME
+volIndex   = input.symbol("CBOE:VIX","Vol Index (regime gauge)", group="Volatility Regime", tooltip="A market regime gauge, NOT the symbol's IV. Pick one that fits: VIX↔SPX/ES/SPY, VXN↔NDX/QQQ, RVX↔RUT/IWM.")
+regimeMethod   = input.string("Index Rank","Regime Method", group="Volatility Regime", options=["Index Rank","Index vs SMA","Index Z-Score"])
+regimeLookback = input.int(200,"Regime Lookback (daily)", group="Volatility Regime", minval=50, maxval=504)
+
+// VOLATILITY RISK PREMIUM
+useVRP      = input.bool(true,"Enable VRP (index matches instrument)", group="Vol Risk Premium", tooltip="ONLY enable when the vol index truly corresponds to this instrument. VRP = index − daily RV. Positive = implied rich vs realized.")
+vrpInScore  = input.bool(true,"Use VRP in Score", group="Vol Risk Premium")
+
+// MTF CONFLUENCE
+useMTF     = input.bool(true,"Enable MTF Displacement Confluence", group="MTF Confluence")
+mtfTF      = input.timeframe("60","HTF Timeframe", group="MTF Confluence")
+mtfBodyMult= input.float(1.2,"HTF Body Multiplier", group="MTF Confluence", minval=0.5, maxval=6.0, step=0.1)
+mtfAtrMult = input.float(1.2,"HTF ATR Expansion",   group="MTF Confluence", minval=0.5, maxval=6.0, step=0.1)
+mtfLen     = input.int(20,"HTF Lookback",           group="MTF Confluence", minval=5, maxval=200)
+
+// ZONES
+zoneSource    = input.string("Body","Zone Boundary", group="Zones", options=["Body","Wick"])
+maxZones      = input.int(10,"Max Active Zones", group="Zones", minval=1, maxval=30)
+zoneExtend    = input.int(120,"Zone Extend (bars)", group="Zones", minval=10, maxval=500)
+decayBars     = input.int(60,"Score Half-Decay (bars)", group="Zones", minval=5, maxval=500, tooltip="Bars over which an untouched zone's effective strength halves.")
+keepBroken    = input.bool(false,"Keep Broken Zones", group="Zones")
+filterOverlap = input.bool(true,"Skip Overlapping Zones", group="Zones")
+
+// FVG
+showFVG    = input.bool(true,"Show Fair Value Gaps", group="FVG")
+fvgExtend  = input.int(60,"FVG Extend (bars)", group="FVG", minval=10, maxval=300)
+maxFvg     = input.int(15,"Max Tracked FVGs", group="FVG", minval=1, maxval=40)
+keepFilled = input.bool(false,"Keep Filled FVGs", group="FVG")
+
+// TRADE LEVELS
+showTL     = input.bool(true,"Show Trade Levels (top zone)", group="Trade Levels")
+tlMinScore = input.float(70.0,"Min Score for Levels (%)", group="Trade Levels", minval=0.0, maxval=100.0, step=5.0)
+stopBuf    = input.float(0.5,"Stop Buffer (x ATR beyond zone)", group="Trade Levels", minval=0.0, maxval=3.0, step=0.1)
+rr1        = input.float(1.0,"TP1 (R multiple)", group="Trade Levels", minval=0.5, maxval=10.0, step=0.5)
+rr2        = input.float(2.0,"TP2 (R multiple)", group="Trade Levels", minval=0.5, maxval=10.0, step=0.5)
+
+// SCORING
+minScore   = input.float(35.0,"Min Score to Display (%)", group="Scoring", minval=0.0, maxval=100.0, step=5.0)
+showLabels = input.bool(true,"Show Zone Labels", group="Scoring")
+
+// SESSION
+useSession   = input.bool(false,"Enable Session Filter", group="Session Filter")
+sNYOpen      = input.bool(true,"NY Open  09:30-10:30", group="Session Filter")
+sLunch       = input.bool(false,"Lunch    12:00-13:30", group="Session Filter")
+sPower       = input.bool(true,"Power Hr 15:00-16:00", group="Session Filter")
+sOvernight   = input.bool(false,"Overnight / Globex", group="Session Filter")
+
+// HTF BIAS (trend gate, separate from MTF displacement)
+useHTFbias = input.bool(false,"Enable HTF Bias Gate", group="HTF Bias")
+htfBiasTF  = input.timeframe("D","HTF Bias Timeframe", group="HTF Bias")
+
+// THEME + DASHBOARD
+theme    = input.string("Slayer","Theme", group="Visuals", options=["Slayer","Classic"])
+showDash = input.bool(true,"Show Dashboard", group="Dashboard")
+dashLoc  = input.string("Top Right","Position", group="Dashboard", options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+dashMode = input.string("Advanced","Dashboard Mode", group="Dashboard", options=["Compact","Advanced"])
+
+// ALERTS
+alertMin = input.float(70.0,"Alert Min Score (%)", group="Alerts", minval=0.0, maxval=100.0, step=5.0)
+
+// ---------------------------------------------------------------------------
+//  THEME PALETTE
+// ---------------------------------------------------------------------------
+slayer = theme == "Slayer"
+C_BULL    = slayer ? #3F9C79 : #00e676
+C_BEAR    = slayer ? #C2615E : #ff1744
+C_STEEL   = slayer ? #6A93B5 : #7986cb
+C_AMBER   = slayer ? #C79350 : #ffb300
+C_BG      = slayer ? #0A0A0B : #0a0e17
+C_DIM     = #78909c
+C_MUTE    = #546e7a
+
+bullBg  = color.new(C_BULL, 92)
+bullBdr = color.new(C_BULL, 35)
+bearBg  = color.new(C_BEAR, 92)
+bearBdr = color.new(C_BEAR, 35)
+testBg  = color.new(C_AMBER, 92)
+testBdr = color.new(C_AMBER, 25)
+mitBg   = color.new(C_STEEL, 92)
+mitBdr  = color.new(C_STEEL, 35)
+brkBg   = color.new(C_BEAR, 88)
+brkBdr  = color.new(C_BEAR, 60)
+
+// ---------------------------------------------------------------------------
+//  HELPERS
+// ---------------------------------------------------------------------------
+// ratio r (>=1 means threshold met) -> 0..1, with r=1 -> 0.5, r>=2 -> 1.0
+normRatio(r) =>
+    math.min(math.max(r, 0.0) / 2.0, 1.0)
+
+// close-position conviction -> 0..1 (0.5 at threshold, 1.0 at extreme)
+convict(p) =>
+    p >= closeThresh ? 0.5 + 0.5 * math.min((p - closeThresh) / math.max(1.0 - closeThresh, 0.01), 1.0) : 0.5 * math.min(p / math.max(closeThresh, 0.01), 1.0)
+
+scoreColor(s) =>
+    s >= 80 ? C_BULL : s >= 60 ? C_AMBER : s >= 40 ? color.new(C_AMBER, 30) : C_BEAR
+
+dashPos(loc) =>
+    switch loc
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.top_right
+
+barsPerYear() =>
+    tfSec = timeframe.in_seconds()
+    if timeframe.ismonthly
+        12.0
+    else if timeframe.isweekly
+        52.0
+    else if timeframe.isdaily
+        252.0
+    else
+        // 23,400s = one 6.5h RTH session
+        tfSec > 0 ? math.max(252.0 * 23400.0 / math.max(float(tfSec), 1.0), 252.0) : 252.0 * 390.0
+
+zoneBounds(bull) =>
+    top = zoneSource == "Body" ? math.max(open, close) : high
+    bot = zoneSource == "Body" ? math.min(open, close) : low
+    [top, bot]
+
+zonesOverlap(tA, bA, tB, bB) =>
+    tA >= bB and bA <= tB
+
+// ---------------------------------------------------------------------------
+//  CANDLE METRICS
+// ---------------------------------------------------------------------------
+body_    = math.abs(close - open)
+range_   = high - low
+avgBody  = ta.sma(body_, length)
+atrVal   = ta.atr(length)
+avgVol   = ta.sma(volume, length)
+
+relBody  = avgBody > 0 ? body_ / avgBody : 0.0
+relRng   = atrVal  > 0 ? range_ / atrVal : 0.0
+relVol   = avgVol  > 0 ? volume / avgVol : 0.0
+closePos = range_  > 0 ? (close - low) / range_ : 0.5
+vwapV    = ta.vwap
+
+// ---------------------------------------------------------------------------
+//  REALIZED VOLATILITY ENGINE
+// ---------------------------------------------------------------------------
+bpy = barsPerYear()
+
+logRet = close[1] > 0 ? math.log(close / close[1]) : 0.0
+lnHL   = low > 0      ? math.log(high / low)       : 0.0
+lnCO   = open > 0     ? math.log(close / open)     : 0.0
+
+ccVar   = logRet * logRet
+parkVar = (1.0 / (4.0 * math.log(2.0))) * lnHL * lnHL
+gkVar   = 0.5 * lnHL * lnHL - (2.0 * math.log(2.0) - 1.0) * lnCO * lnCO
+
+rvFrom(varSeries, n, periodsPerYear) =>
+    math.sqrt(math.max(ta.sma(varSeries, n), 0.0) * periodsPerYear) * 100.0
+
+// compute every estimator each bar (ta.sma must run unconditionally), then select
+rvCC   = rvFrom(ccVar,   rvLen, bpy)
+rvPk   = rvFrom(parkVar, rvLen, bpy)
+rvGK   = rvFrom(gkVar,   rvLen, bpy)
+rvLive = rvEstimator == "Parkinson" ? rvPk : rvEstimator == "Garman-Klass" ? rvGK : rvCC
+
+// Daily RV for regime ranking and VRP (computed in the daily context)
+rvDailyExpr() =>
+    lr = close[1] > 0 ? math.log(close / close[1]) : 0.0
+    hl = low > 0      ? math.log(high / low)       : 0.0
+    co = open > 0     ? math.log(close / open)     : 0.0
+    cc = lr * lr
+    pk = (1.0 / (4.0 * math.log(2.0))) * hl * hl
+    gk = 0.5 * hl * hl - (2.0 * math.log(2.0) - 1.0) * co * co
+    v  = rvEstimator == "Parkinson" ? pk : rvEstimator == "Garman-Klass" ? gk : cc
+    math.sqrt(math.max(ta.sma(v, 20), 0.0) * 252.0) * 100.0
+
+rvDaily = request.security(syminfo.tickerid, "D", rvDailyExpr(), lookahead=barmerge.lookahead_off)
+
+// 1-sigma expected move for one trading day
+rvForEM = rvLive
+emDay   = close * (rvForEM / 100.0) * math.sqrt(1.0 / 252.0)
+
+// ---------------------------------------------------------------------------
+//  VOL INDEX + REGIME + VRP
+// ---------------------------------------------------------------------------
+vix     = request.security(volIndex, timeframe.period, close, ignore_invalid_symbol=true)
+vixD    = request.security(volIndex, "D", close, ignore_invalid_symbol=true)
+vixOk   = not na(vixD)
+
+idx52H  = ta.highest(nz(vixD, 0.0), 252)
+idx52L  = ta.lowest(nz(vixD, 1e9), 252)
+idxRank = vixOk and idx52H > idx52L ? (vixD - idx52L) / (idx52H - idx52L) * 100.0 : na
+
+idxSma  = ta.sma(vixD, regimeLookback)
+idxDev  = vixOk and idxSma > 0 ? (vixD - idxSma) / idxSma * 100.0 : na
+idxStd  = ta.stdev(vixD, regimeLookback)
+idxZ    = vixOk and idxStd > 0 ? (vixD - idxSma) / idxStd : na
+
+// regimeExp01 in 0..1: higher = more expanded vol regime
+regimeExp01 = 0.5
+regimeLbl   = "n/a"
+regimeClr   = C_MUTE
+if vixOk
+    if regimeMethod == "Index Rank"
+        regimeExp01 := nz(idxRank, 50.0) / 100.0
+        regimeLbl   := (idxRank >= 75 ? "HIGH" : idxRank >= 50 ? "ELEV" : idxRank >= 25 ? "LOW" : "COMP") + " rank " + str.tostring(math.round(nz(idxRank,0))) + "%"
+        regimeClr   := idxRank >= 50 ? C_BEAR : idxRank >= 25 ? C_AMBER : C_BULL
+    else if regimeMethod == "Index vs SMA"
+        regimeExp01 := math.min(math.max((nz(idxDev, 0.0) + 20.0) / 40.0, 0.0), 1.0)
+        regimeLbl   := (idxDev >= 15 ? "ABOVE" : idxDev >= 0 ? "AT" : idxDev >= -15 ? "BELOW" : "WELL BELOW") + " SMA"
+        regimeClr   := idxDev >= 0 ? C_BEAR : C_BULL
+    else
+        regimeExp01 := math.min(math.max((nz(idxZ, 0.0) + 1.5) / 3.0, 0.0), 1.0)
+        regimeLbl   := "Z " + str.tostring(nz(idxZ, 0.0), "#.##")
+        regimeClr   := idxZ >= 0.5 ? C_BEAR : idxZ >= -0.5 ? C_AMBER : C_BULL
+
+// Volatility Risk Premium (index − daily RV), only when index matches instrument
+vrp        = useVRP and vixOk ? vixD - rvDaily : na
+vrpMean    = ta.sma(nz(vrp, 0.0), 60)
+vrpStd     = ta.stdev(nz(vrp, 0.0), 60)
+vrpZ       = useVRP and vixOk and vrpStd > 0 ? (vrp - vrpMean) / vrpStd : na
+vrpApplic  = useVRP and vixOk and not na(vrp)
+
+// VRP context for scoring (HEURISTIC, uncalibrated):
+//   high VRP (implied rich, mean-revert regime) -> displacement breakout less favored
+//   low/neg VRP (realized >= implied, expansion regime) -> displacement favored
+vrpContext01() =>
+    not vrpApplic ? 0.5 : math.min(math.max(0.5 - nz(vrpZ, 0.0) * 0.25, 0.0), 1.0)
+
+// ---------------------------------------------------------------------------
+//  STRUCTURE
+// ---------------------------------------------------------------------------
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+var float lastPH = na
+var float lastPL = na
+lastPH := na(ph) ? lastPH : ph
+lastPL := na(pl) ? lastPL : pl
+
+fastPH = high[1] > high[2] and high[1] > high[0]
+fastPL = low[1]  < low[2]  and low[1]  < low[0]
+var float fastPHv = na
+var float fastPLv = na
+fastPHv := fastPH ? high[1] : fastPHv
+fastPLv := fastPL ? low[1]  : fastPLv
+
+fracPH = high[2] > high[4] and high[2] > high[3] and high[2] > high[1] and high[2] > high[0]
+fracPL = low[2]  < low[4]  and low[2]  < low[3]  and low[2]  < low[1]  and low[2]  < low[0]
+var float fracPHv = na
+var float fracPLv = na
+fracPHv := fracPH ? high[2] : fracPHv
+fracPLv := fracPL ? low[2]  : fracPLv
+
+brkBull = structMode == "Fast (1-bar)"    ? (not na(fastPHv) and close > fastPHv) :
+          structMode == "Fractal (3-bar)" ? (not na(fracPHv) and close > fracPHv) :
+          (not na(lastPH) and close > lastPH)
+brkBear = structMode == "Fast (1-bar)"    ? (not na(fastPLv) and close < fastPLv) :
+          structMode == "Fractal (3-bar)" ? (not na(fracPLv) and close < fracPLv) :
+          (not na(lastPL) and close < lastPL)
+
+// ---------------------------------------------------------------------------
+//  MTF DISPLACEMENT CONFLUENCE
+// ---------------------------------------------------------------------------
+mtfDispDir() =>
+    b  = math.abs(close - open)
+    r  = high - low
+    ab = ta.sma(b, mtfLen)
+    av = ta.atr(mtfLen)
+    rb = ab > 0 ? b / ab : 0.0
+    rr = av > 0 ? r / av : 0.0
+    dir = close > open ? 1 : close < open ? -1 : 0
+    (rb >= mtfBodyMult and rr >= mtfAtrMult) ? dir : 0
+
+htfDirRaw = request.security(syminfo.tickerid, mtfTF, mtfDispDir(), lookahead=barmerge.lookahead_off)
+htfDir    = useMTF ? htfDirRaw : 0
+
+// ---------------------------------------------------------------------------
+//  HTF BIAS GATE
+// ---------------------------------------------------------------------------
+[hbClose, hbVwap, hbEma] = request.security(syminfo.tickerid, htfBiasTF, [close, ta.vwap, ta.ema(close, 50)], lookahead=barmerge.lookahead_off)
+hbBull = hbClose > hbVwap and hbClose > hbEma
+hbBear = hbClose < hbVwap and hbClose < hbEma
+hbLbl  = hbBull ? "BULL" : hbBear ? "BEAR" : "MIXED"
+hbClr  = hbBull ? C_BULL : hbBear ? C_BEAR : C_AMBER
+
+// ---------------------------------------------------------------------------
+//  SESSION
+// ---------------------------------------------------------------------------
+tz = "America/New_York"
+nyOpen = time(timeframe.period, "0930-1030:23456", tz)
+lunch  = time(timeframe.period, "1200-1330:23456", tz)
+power  = time(timeframe.period, "1500-1600:23456", tz)
+ovn    = time(timeframe.period, "1800-0930:23456", tz)
+inSession = not useSession or (sNYOpen and not na(nyOpen)) or (sLunch and not na(lunch)) or (sPower and not na(power)) or (sOvernight and not na(ovn))
+curSession = not na(nyOpen) ? "NY OPEN" : not na(lunch) ? "LUNCH" : not na(power) ? "PWR HR" : not na(ovn) ? "GLOBEX" : "MID-DAY"
+
+// ---------------------------------------------------------------------------
+//  DISPLACEMENT DETECTION
+// ---------------------------------------------------------------------------
+isBull = close > open
+isBear = close < open
+bodyOK = relBody >= bodyMult
+atrOK  = relRng  >= atrMult
+volOK  = relVol  >= volMult
+closeOKBull = closePos >= closeThresh
+closeOKBear = (1.0 - closePos) >= closeThresh
+
+volFilt    = useVol    ? volOK   : true
+structBull = useStruct ? brkBull : true
+structBear = useStruct ? brkBear : true
+biasBull   = not useHTFbias or hbBull
+biasBear   = not useHTFbias or hbBear
+
+rawBull = isBull and bodyOK and atrOK and closeOKBull and volFilt and structBull
+rawBear = isBear and bodyOK and atrOK and closeOKBear and volFilt and structBear
+
+// ---------------------------------------------------------------------------
+//  TRANSPARENT SCORING  (8 components, weights sum to 100)
+// ---------------------------------------------------------------------------
+calcScore(bull) =>
+    cBody   = normRatio(relBody / bodyMult)                                   * W_BODY
+    cAtr    = normRatio(relRng  / atrMult)                                    * W_ATR
+    cClose  = (bull ? convict(closePos) : convict(1.0 - closePos))            * W_CLOSE
+    cStruct = ((bull ? brkBull : brkBear) ? 1.0 : 0.0)                        * W_STRUCT
+    cVol    = normRatio(relVol / volMult)                                     * W_VOL
+    cRegime = regimeExp01                                                     * W_REGIME
+    mtf01   = not useMTF ? 0.5 : bull ? (htfDir > 0 ? 1.0 : htfDir < 0 ? 0.0 : 0.5) : (htfDir < 0 ? 1.0 : htfDir > 0 ? 0.0 : 0.5)
+    cMtf    = mtf01                                                           * W_MTF
+    cVrp    = (vrpInScore ? vrpContext01() : 0.5)                             * W_VRP
+    math.min(math.max(cBody + cAtr + cClose + cStruct + cVol + cRegime + cMtf + cVrp, 0.0), 100.0)
+
+scoreBull = calcScore(true)
+scoreBear = calcScore(false)
+curScore  = isBull ? scoreBull : isBear ? scoreBear : math.max(scoreBull, scoreBear)
+
+signalOk = not confirmBar or barstate.isconfirmed
+dispBull = signalOk and rawBull and scoreBull >= minScore and inSession and biasBull
+dispBear = signalOk and rawBear and scoreBear >= minScore and inSession and biasBear
+
+// ---------------------------------------------------------------------------
+//  TYPES
+// ---------------------------------------------------------------------------
+type Zone
+    float top
+    float bottom
+    bool  isBull
+    float score
+    int   state
+    int   startBar
+    int   touches
+    box   zb
+    label lb
+
+type Fvg
+    float top
+    float bottom
+    bool  isBull
+    int   startBar
+    int   state
+    box   fb
+
+// effective strength after age decay
+ageStrength(scoreVal, startBar) =>
+    age = bar_index - startBar
+    scoreVal * math.pow(0.5, age / math.max(float(decayBars), 1.0))
+
+// ---------------------------------------------------------------------------
+//  ZONE MANAGEMENT
+// ---------------------------------------------------------------------------
+var Zone[] zones = array.new<Zone>()
+var int nActive  = 0
+var int nTested  = 0
+
+nActive := 0
+nTested := 0
+rightEdge = bar_index + 3
+
+if array.size(zones) > 0
+    int i = array.size(zones) - 1
+    while i >= 0
+        z = array.get(zones, i)
+
+        if z.state == STATE_BROKEN
+            if keepBroken
+                box.set_right(z.zb, rightEdge)
+                i -= 1
+                continue
+            else
+                box.delete(z.zb)
+                label.delete(z.lb)
+                array.remove(zones, i)
+                i -= 1
+                continue
+
+        box.set_right(z.zb, rightEdge)
+
+        inNow    = z.isBull ? (low <= z.top and high >= z.bottom) : (high >= z.bottom and low <= z.top)
+        breached = z.isBull ? close < z.bottom : close > z.top
+        reacted  = z.isBull ? (low <= z.top and close > z.top) : (high >= z.bottom and close < z.bottom)
+
+        if breached
+            z.state := STATE_BROKEN
+            box.set_bgcolor(z.zb, brkBg)
+            box.set_border_color(z.zb, brkBdr)
+            if not na(z.lb)
+                label.set_text(z.lb, "BROKEN")
+                label.set_textcolor(z.lb, C_BEAR)
+            array.set(zones, i, z)
+            i -= 1
+            continue
+
+        if inNow
+            if z.state == STATE_ACTIVE
+                z.touches += 1
+            z.state := reacted ? STATE_MIT : STATE_TEST
+
+        if z.state == STATE_ACTIVE
+            nActive += 1
+        else
+            nTested += 1
+
+        bg = z.state == STATE_TEST ? testBg : z.state == STATE_MIT ? mitBg : z.isBull ? bullBg : bearBg
+        bd = z.state == STATE_TEST ? testBdr : z.state == STATE_MIT ? mitBdr : z.isBull ? bullBdr : bearBdr
+        tc = z.state == STATE_TEST ? C_AMBER : z.state == STATE_MIT ? C_STEEL : z.isBull ? C_BULL : C_BEAR
+        box.set_bgcolor(z.zb, bg)
+        box.set_border_color(z.zb, bd)
+        if not na(z.lb)
+            st = z.state == STATE_TEST ? "TEST" : z.state == STATE_MIT ? "MIT" : "ACTIVE"
+            eff = math.round(ageStrength(z.score, z.startBar))
+            label.set_text(z.lb, str.tostring(math.round(z.score)) + "% " + st + (z.touches > 0 ? " ·" + str.tostring(z.touches) : ""))
+            label.set_textcolor(z.lb, tc)
+
+        array.set(zones, i, z)
+        i -= 1
+
+// create new zone
+if dispBull or dispBear
+    bull = dispBull
+    sc   = bull ? scoreBull : scoreBear
+    [zT, zB] = zoneBounds(bull)
+
+    // overlap check
+    overlap = false
+    if filterOverlap and array.size(zones) > 0
+        for j = 0 to array.size(zones) - 1
+            zz = array.get(zones, j)
+            if zz.state != STATE_BROKEN and zz.isBull == bull and zonesOverlap(zT, zB, zz.top, zz.bottom)
+                overlap := true
+                break
+
+    if not overlap
+        while array.size(zones) >= maxZones
+            old = array.shift(zones)
+            box.delete(old.zb)
+            label.delete(old.lb)
+
+        zbox = box.new(bar_index, zT, bar_index + zoneExtend, zB, bgcolor=bull ? bullBg : bearBg, border_color=bull ? bullBdr : bearBdr, border_width=1)
+        zlbl = label(na)
+        if showLabels
+            zlbl := label.new(bar_index, bull ? zT : zB, str.tostring(math.round(sc)) + "% ACTIVE", style=bull ? label.style_label_lower_right : label.style_label_upper_right, color=color.new(C_BG, 15), textcolor=bull ? C_BULL : C_BEAR, size=size.tiny)
+        array.push(zones, Zone.new(top=zT, bottom=zB, isBull=bull, score=sc, state=STATE_ACTIVE, startBar=bar_index, touches=0, zb=zbox, lb=zlbl))
+        nActive += 1
+
+// ---------------------------------------------------------------------------
+//  FVG TRACKING (open -> CE -> filled)
+// ---------------------------------------------------------------------------
+var Fvg[] fvgs = array.new<Fvg>()
+
+bullFvg = low > high[2]
+bearFvg = high < low[2]
+
+if showFVG and barstate.isconfirmed and (bullFvg or bearFvg)
+    bull = bullFvg
+    ft = bull ? low : low[2]
+    fb = bull ? high[2] : high
+    while array.size(fvgs) >= maxFvg
+        of = array.shift(fvgs)
+        box.delete(of.fb)
+    fbox = box.new(bar_index - 2, ft, bar_index + fvgExtend, fb, bgcolor=color.new(bull ? C_BULL : C_AMBER, 92), border_color=color.new(bull ? C_BULL : C_AMBER, 45), border_width=1)
+    array.push(fvgs, Fvg.new(top=ft, bottom=fb, isBull=bull, startBar=bar_index - 2, state=FVG_OPEN, fb=fbox))
+
+if array.size(fvgs) > 0
+    int k = array.size(fvgs) - 1
+    while k >= 0
+        f = array.get(fvgs, k)
+        mid = (f.top + f.bottom) / 2.0
+        if f.state != FVG_FILLED
+            box.set_right(f.fb, math.min(f.startBar + fvgExtend, rightEdge))
+            filled = f.isBull ? low <= f.bottom : high >= f.top
+            ceHit  = f.isBull ? low <= mid       : high >= mid
+            if filled
+                f.state := FVG_FILLED
+                box.set_bgcolor(f.fb, color.new(C_MUTE, 90))
+                box.set_border_color(f.fb, color.new(C_MUTE, 60))
+                if not keepFilled
+                    box.delete(f.fb)
+                    array.remove(fvgs, k)
+                    k -= 1
+                    continue
+            else if ceHit and f.state == FVG_OPEN
+                f.state := FVG_CE
+                box.set_border_color(f.fb, color.new(f.isBull ? C_BULL : C_AMBER, 15))
+            array.set(fvgs, k, f)
+        k -= 1
+
+// ---------------------------------------------------------------------------
+//  TRADE LEVELS (top-scoring fresh zone)
+// ---------------------------------------------------------------------------
+var line tEntry = na
+var line tStop  = na
+var line tT1    = na
+var line tT2    = na
+var label tLbl  = na
+var float planEntry  = na
+var float planStop   = na
+var float planT1     = na
+var float planT2     = na
+var bool  planActive = false
+var bool  planBull   = false
+
+clearLevels() =>
+    line.delete(tEntry), line.delete(tStop), line.delete(tT1), line.delete(tT2), label.delete(tLbl)
+
+if showTL and (dispBull or dispBear)
+    sc = dispBull ? scoreBull : scoreBear
+    if sc >= tlMinScore
+        bull = dispBull
+        [zT, zB] = zoneBounds(bull)
+        buf  = atrVal * stopBuf
+        entry = bull ? zT : zB
+        stop  = bull ? zB - buf : zT + buf
+        risk  = math.abs(entry - stop)
+        t1    = bull ? entry + risk * rr1 : entry - risk * rr1
+        t2    = bull ? entry + risk * rr2 : entry - risk * rr2
+        clearLevels()
+        re = bar_index + zoneExtend
+        tEntry := line.new(bar_index, entry, re, entry, color=C_STEEL, style=line.style_solid, width=1)
+        tStop  := line.new(bar_index, stop,  re, stop,  color=C_BEAR,  style=line.style_dashed, width=1)
+        tT1    := line.new(bar_index, t1,    re, t1,    color=C_BULL,  style=line.style_dotted, width=1)
+        tT2    := line.new(bar_index, t2,    re, t2,    color=C_BULL,  style=line.style_dashed, width=1)
+        tLbl   := label.new(re, entry, "ENTRY " + str.tostring(entry, format.mintick) + "  SL " + str.tostring(stop, format.mintick) + "\nTP1 " + str.tostring(t1, format.mintick) + "  TP2 " + str.tostring(t2, format.mintick), style=label.style_label_left, color=color.new(C_BG, 15), textcolor=C_STEEL, size=size.tiny)
+        planEntry  := entry
+        planStop   := stop
+        planT1     := t1
+        planT2     := t2
+        planBull   := bull
+        planActive := true
+
+// ---------------------------------------------------------------------------
+//  EXPECTED MOVE + VWAP + SIGNAL SHAPES
+// ---------------------------------------------------------------------------
+var line emHi = na
+var line emLo = na
+var label emHl = na
+var label emLl = na
+if showEM and barstate.islast
+    line.delete(emHi), line.delete(emLo), label.delete(emHl), label.delete(emLl)
+    emHi := line.new(bar_index, close + emDay, bar_index + 15, close + emDay, color=color.new(C_STEEL, 35), style=line.style_dashed)
+    emLo := line.new(bar_index, close - emDay, bar_index + 15, close - emDay, color=color.new(C_STEEL, 35), style=line.style_dashed)
+    emHl := label.new(bar_index + 16, close + emDay, "1σ EM +" + str.tostring(emDay, "#.##"), style=label.style_label_left, color=color.new(C_BG, 20), textcolor=C_STEEL, size=size.tiny)
+    emLl := label.new(bar_index + 16, close - emDay, "1σ EM -" + str.tostring(emDay, "#.##"), style=label.style_label_left, color=color.new(C_BG, 20), textcolor=C_STEEL, size=size.tiny)
+
+plot(vwapV, "VWAP", color=color.new(C_STEEL, 50), linewidth=1)
+plotshape(dispBull, "Bull Displacement", shape.triangleup, location.belowbar, C_BULL, size=size.tiny)
+plotshape(dispBear, "Bear Displacement", shape.triangledown, location.abovebar, C_BEAR, size=size.tiny)
+
+// ---------------------------------------------------------------------------
+//  DASHBOARD
+// ---------------------------------------------------------------------------
+var table dash = table.new(dashPos(dashLoc), 2, 22, bgcolor=color.new(C_BG, 8), border_color=color.new(C_MUTE, 55), border_width=1, frame_color=color.new(C_STEEL, 45), frame_width=1)
+
+f_row(r, k, v, vc) =>
+    table.cell(dash, 0, r, k, text_color=C_DIM, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, v, text_color=vc,    text_size=size.small, text_halign=text.align_right)
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "DISPLACEMENT", bgcolor=color.new(C_STEEL, 75), text_color=#e8eaf6, text_size=size.small)
+    table.cell(dash, 1, 0, "VOL ENGINE v6", bgcolor=color.new(C_STEEL, 75), text_color=C_AMBER, text_size=size.small)
+
+    sigTxt = dispBull ? "BULL ▲" : dispBear ? "BEAR ▼" : "— no signal"
+    sigClr = dispBull ? C_BULL : dispBear ? C_BEAR : C_MUTE
+    f_row(1, "Signal", sigTxt, sigClr)
+
+    table.cell(dash, 0, 2, "Score", text_color=C_DIM, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(math.round(curScore)) + " / 100", text_color=scoreColor(curScore), text_size=size.normal, text_halign=text.align_right)
+
+    sOk = isBull ? brkBull : brkBear
+    f_row(3, "Structure", sOk ? "BREAK ✓" : "hold —", sOk ? C_BULL : C_BEAR)
+    f_row(4, "Vol Regime", regimeLbl, regimeClr)
+
+    vwA = close > vwapV
+    f_row(5, "VWAP", vwA ? "above" : "below", vwA ? C_BULL : C_BEAR)
+    f_row(6, "Active zones", str.tostring(nActive), nActive > 0 ? C_BULL : C_MUTE)
+    f_row(7, "MTF " + (useMTF ? mtfTF : "off"), useMTF ? (htfDir > 0 ? "BULL ▲" : htfDir < 0 ? "BEAR ▼" : "flat") : "—", useMTF ? (htfDir > 0 ? C_BULL : htfDir < 0 ? C_BEAR : C_MUTE) : C_MUTE)
+    f_row(8, "Session", curSession, inSession ? C_BULL : C_MUTE)
+
+    if dashMode == "Advanced"
+        table.cell(dash, 0, 9, "— VOLATILITY —", text_color=C_STEEL, text_size=size.small)
+        table.cell(dash, 1, 9, rvEstimator, text_color=C_STEEL, text_size=size.small, text_halign=text.align_right)
+
+        f_row(10, "RV chart (" + str.tostring(rvLen) + ")", str.tostring(rvLive, "#.#") + "%", C_DIM)
+        f_row(11, "RV daily", str.tostring(rvDaily, "#.#") + "%", C_DIM)
+        f_row(12, "Vol index", vixOk ? str.tostring(vixD, "#.#") : "n/a", vixOk ? C_AMBER : C_MUTE)
+
+        vrpTxt = vrpApplic ? (vrp >= 0 ? "+" : "") + str.tostring(vrp, "#.#") + (vrp >= 0 ? " rich" : " cheap") : "off / n/a"
+        vrpClr = vrpApplic ? (vrp >= 0 ? C_BEAR : C_BULL) : C_MUTE
+        f_row(13, "VRP (idx−RV)", vrpTxt, vrpClr)
+
+        f_row(14, "1σ Exp Move", "± " + str.tostring(emDay, "#.##"), C_STEEL)
+        f_row(15, "Body x", str.tostring(relBody, "#.##") + (bodyOK ? " ✓" : " —"), bodyOK ? C_BULL : C_BEAR)
+        f_row(16, "ATR x", str.tostring(relRng, "#.##") + (atrOK ? " ✓" : " —"), atrOK ? C_BULL : C_BEAR)
+        f_row(17, "Volume x", str.tostring(relVol, "#.##") + (volOK ? " ✓" : " —"), volOK ? C_BULL : C_BEAR)
+        f_row(18, "Tested zones", str.tostring(nTested), nTested > 0 ? C_AMBER : C_MUTE)
+        f_row(19, "HTF bias", useHTFbias ? hbLbl : "off", useHTFbias ? hbClr : C_MUTE)
+
+        plTxt = planActive ? (planBull ? "L " : "S ") + str.tostring(planEntry, format.mintick) : "—"
+        f_row(20, "Last plan", plTxt, planActive ? C_STEEL : C_MUTE)
+        f_row(21, "Theme / zone", (slayer ? "Slayer" : "Classic") + " / " + zoneSource, C_MUTE)
+
+// ---------------------------------------------------------------------------
+//  ALERTS — structured payload for webhook / Discord bot ingestion
+// ---------------------------------------------------------------------------
+[zT, zB] = zoneBounds(dispBull)
+vrpStr   = vrpApplic ? str.tostring(vrp, "#.##") : "na"
+mtfStr   = useMTF ? (htfDir > 0 ? "bull" : htfDir < 0 ? "bear" : "flat") : "off"
+
+payload(dir, sc) =>
+    '{"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","sig":"' + dir + '",' +
+     '"score":' + str.tostring(math.round(sc)) + ',' +
+     '"price":' + str.tostring(close, format.mintick) + ',' +
+     '"zone_top":' + str.tostring(zT, format.mintick) + ',"zone_bot":' + str.tostring(zB, format.mintick) + ',' +
+     '"entry":' + str.tostring(nz(planEntry, close), format.mintick) + ',"stop":' + str.tostring(nz(planStop, na), format.mintick) + ',' +
+     '"tp1":' + str.tostring(nz(planT1, na), format.mintick) + ',"tp2":' + str.tostring(nz(planT2, na), format.mintick) + ',' +
+     '"rv":' + str.tostring(rvLive, "#.#") + ',"vol_index":' + (vixOk ? str.tostring(vixD, "#.#") : "null") + ',' +
+     '"vrp":' + (vrpApplic ? str.tostring(vrp, "#.##") : "null") + ',"regime":"' + regimeLbl + '","mtf":"' + mtfStr + '"}'
+
+alertcondition(dispBull and scoreBull >= alertMin, "Bull Displacement", "BULL DISPLACEMENT — {{ticker}} {{interval}}")
+alertcondition(dispBear and scoreBear >= alertMin, "Bear Displacement", "BEAR DISPLACEMENT — {{ticker}} {{interval}}")
+
+if dispBull and scoreBull >= alertMin
+    alert(payload("bull", scoreBull), alert.freq_once_per_bar_close)
+if dispBear and scoreBear >= alertMin
+    alert(payload("bear", scoreBear), alert.freq_once_per_bar_close)

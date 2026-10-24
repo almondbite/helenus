@@ -28,7 +28,10 @@ from helenus.engine import flow as flow_engine
 from helenus.engine import gex as gex_engine
 from helenus.engine import gexmap as gexmap_engine
 from helenus.engine import intermarket as intermarket_engine
+from helenus.engine import conviction as conviction_engine
 from helenus.engine import scalp as scalp_engine
+from helenus.engine import sq9 as sq9_engine
+from helenus.engine import zones as zones_engine
 from helenus.engine import displacement as displacement_engine
 from helenus.engine import orb as orb_engine
 from helenus.engine import moc as moc_engine
@@ -44,6 +47,7 @@ from helenus.engine.scan2 import (
     TriggerType,
     detect_approach,
     detect_candidate,
+    detect_regime_flip,
 )
 from helenus.journal import (
     Journal,
@@ -115,6 +119,16 @@ class HelenusBot(commands.Bot):
         # EMA-ignition contract scalp — index 5/9/200 EMAs + the gated cross.
         # Stateful (mirrors VannaTracker): on_chain per poll, on_bar per bar.
         self.scalp = scalp_engine.ScalpEngine()
+        # Gann Square-of-9 lattice — confluence MODIFIER + exit grid only (it
+        # never initiates or vetoes; its levels stay out of the key-level grid).
+        self.sq9 = sq9_engine.Sq9Engine()
+        self.sq9_reading: sq9_engine.Sq9Reading | None = None
+        # Task-4 displacement port: the conviction oscillator (enrich + the
+        # LIQ_REJECT trigger) and the persistent zone lifecycle.
+        self.conviction = conviction_engine.ConvictionEngine()
+        self.conviction_reading: conviction_engine.ConvictionReading | None = None
+        self.zones = zones_engine.ZoneEngine()
+        self.zone_reading: zones_engine.ZoneReading | None = None
         self.scalp_reading: scalp_engine.ScalpReading | None = None
 
         # Displacement (institutional thrust) — pure, computed per bar off the
@@ -148,6 +162,9 @@ class HelenusBot(commands.Bot):
         self.active_arm: ApproachArm | None = None
         self._arm_ttl: int = 0
         self._watch_log: dict[str, float] = {}
+        # Last muted regime-flip info post (Task-1 decoupling) — its own cooldown
+        # so spot oscillating on the zero-Γ pivot doesn't spam the channel.
+        self._regime_flip_at: float = -1e9
         # ES-leads-SPX micro-lead — a streamed /ES thrust ARMS a direction; the
         # gate fires an ES-led candidate the moment SPX confirms. The arm decays
         # over `_es_arm_ttl` bars and is only fed behind the stream staleness gate.
@@ -198,6 +215,13 @@ class HelenusBot(commands.Bot):
         # Seed the scalp EMAs from the backfilled tape so a mid-session restart
         # doesn't print a false cross on the first live bar.
         self.scalp.warm(list(self.state.bars))
+        # Sq9 anchors off the session open (bars[0] of the 09:30 backfill), so a
+        # mid-session restart rebuilds the same lattice the live session had.
+        self.sq9.warm(list(self.state.bars))
+        # Conviction indicators + the zone/FVG lists replay the backfill, so a
+        # mid-session restart rebuilds the same structure the session grew.
+        self.conviction.warm(list(self.state.bars))
+        self.zones.warm(list(self.state.bars))
         # Rebuild the locked opening range (and suppress an already-broken session)
         # from the backfill, so a restart doesn't re-alert a past ORB breakout.
         self.orb.warm(list(self.state.bars))
@@ -213,6 +237,9 @@ class HelenusBot(commands.Bot):
         self.add_command(cmd_inter)
         self.add_command(cmd_stats)
         self.add_command(cmd_review)
+        self.add_command(cmd_sq9)
+        self.add_command(cmd_conv)
+        self.add_command(cmd_zones)
         # chain_worker self-paces, so it's a raw task; the rest are tasks.loop
         self._chain_task = asyncio.create_task(self._chain_worker(), name="chain_worker")
         # The streaming feed self-paces its own reconnect loop (raw task too).
@@ -362,6 +389,9 @@ class HelenusBot(commands.Bot):
         self.scalp_reading = self.scalp.on_bar(
             self.state, self.profile, self.vanna_reading, self.charm_profile
         )
+        # Sq9 lattice read (anchor, nearest rings, this bar's reaction) — None
+        # when disabled; consumed only as a modifier + exit grid downstream.
+        self.sq9_reading = self.sq9.on_bar(self.state)
         # Displacement (pure, off the tape) + ORB (stateful range) reads, also
         # every bar so the structure/range stay live between fires.
         self.displacement_reading = displacement_engine.build_displacement(
@@ -390,6 +420,14 @@ class HelenusBot(commands.Bot):
         # /ES cumulative-delta exhaustion read — None when disabled or the stream
         # is stale (clean fallback to today's behavior).
         self.cumdelta_reading = self.stream.cumdelta_reading()
+        # Task-4 displacement port: the conviction oscillator (rewired to the
+        # SPY-proxy volume on the tape + ES cumulative delta when the stream is
+        # live) and the persistent zone lifecycle. Both are None when disabled.
+        cum_delta = (
+            self.cumdelta_reading.cum_delta if self.cumdelta_reading is not None else None
+        )
+        self.conviction_reading = self.conviction.on_bar(self.state, cum_delta)
+        self.zone_reading = self.zones.on_bar(self.state)
         # ES-leads-SPX: feed the streamed /ES bar-close into the lead tracker and
         # maintain the arm (behind the stream staleness gate; arm decays to None
         # when /ES is stale/disabled, so the poll-only path is unchanged).
@@ -400,12 +438,22 @@ class HelenusBot(commands.Bot):
                 self.state, self.profile, self.charm_profile,
                 self.vanna_reading, self.cumdelta_reading,
                 self.gex_map if CONFIG.gexmap.enabled else None,
+                self.zone_reading,
             ) if CONFIG.approach.enabled else None
         )
+        # Task-1 decoupling: the zero-Γ cross is no longer a scored trigger. The
+        # gamma-SIGN change is still worth eyes, so post a muted, ungraded
+        # regime-router note instead (legacy mode keeps the scored REGIME_FLIP
+        # candidate inside detect_candidate).
+        if not CONFIG.gex.levels_in_signal:
+            flip_note = detect_regime_flip(self.state, self.profile)
+            if flip_note is not None:
+                await self._post_regime_flip(flip_note)
         candidate = detect_candidate(
             self.state, self.profile, self.vanna_reading, self.charm_profile,
             self.scalp_reading, self.displacement_reading, self.orb_reading,
             self.moc_reading, self.cumdelta_reading, self._es_arm,
+            self.conviction_reading,
         )
         if candidate is None or self._candidate_recently_judged(candidate):
             return
@@ -447,6 +495,9 @@ class HelenusBot(commands.Bot):
             self.cumdelta_reading,
             self.active_arm,
             self.gex_map,
+            self.sq9_reading,
+            self.conviction_reading,
+            self.zone_reading,
         )
         # A transient Claude failure (overload/500) must NOT consume this
         # candidate's cooldown — otherwise one blip silences the trigger+level
@@ -761,7 +812,9 @@ class HelenusBot(commands.Bot):
         CONFIG.gexmap.enabled and the candidate carries an implied direction; the map
         move triggers are exempt. Records the reason for the log line."""
         self._last_map_reason = ""
-        if not CONFIG.gexmap.enabled or self.gex_map is None:
+        # map_gating_active: inert under the Task-1 decoupling — the map is level
+        # machinery (it keeps running for !scan + journal measurement).
+        if not gexmap_engine.map_gating_active() or self.gex_map is None:
             return False
         if candidate.trigger in gexmap_engine.MAP_EXEMPT_TRIGGERS:
             return False
@@ -777,6 +830,18 @@ class HelenusBot(commands.Bot):
             self._last_map_reason = "; ".join(assessment.reasons)
             return True
         return False
+
+    async def _post_regime_flip(self, note: str) -> None:
+        """Muted regime-router note (Task-1 decoupling): spot crossed the zero-Γ
+        pivot, so the gamma SIGN — the momentum-vs-reversion label — changed.
+        Posted directly like the WATCH/briefings (grey, no trade plan, never
+        journaled or graded), behind its own cooldown so spot oscillating on the
+        pivot doesn't spam."""
+        now = asyncio.get_running_loop().time()
+        if now - self._regime_flip_at < CANDIDATE_COOLDOWN_SECS:
+            return
+        self._regime_flip_at = now
+        await self._post(embeds.regime_flip_embed(note, self.profile))
 
     async def _update_arm(self, arm: ApproachArm | None) -> None:
         """Stage-1 arm lifecycle: tick down the live arm's TTL and expire it; then
@@ -844,6 +909,67 @@ class HelenusBot(commands.Bot):
                 else None
             ),
         }
+        # Sq9 measurement (Task 3) — everything the validation back-tagging needs
+        # to grade BOTH roles: does an aligned reaction at a ring at ENTRY improve
+        # expectancy (the modifier's claim), and do rings predict where moves
+        # stall (the exit-grid's claim, measured against MFE + the target dist)?
+        sq = self.sq9_reading
+        if sq is not None:
+            lvl_price = sig.level.price if sig.level is not None else None
+            sq9_delta, _n = sq9_engine.assess(sq, sig.direction, lvl_price)
+            target, _stop = sq.grid.exit_grid(sig.direction, sq.spot)
+            dists = [d for d in (sq.dist_above_pts, sq.dist_below_pts) if d is not None]
+            context.update(
+                {
+                    "sq9_anchor": round(sq.grid.anchor, 2),
+                    "sq9_anchor_kind": sq.grid.anchor_kind,
+                    "sq9_step_degrees": CONFIG.sq9.step_degrees,
+                    "sq9_dist_to_ring_at_entry": round(min(dists), 2) if dists else None,
+                    "sq9_reacted": bool(
+                        sq.reaction is not None and sq.reaction.direction == sig.direction
+                    ),
+                    "sq9_coincide": bool(
+                        sq.reaction is not None
+                        and lvl_price is not None
+                        and abs(sq.reaction.level.price - lvl_price) <= CONFIG.sq9.coincide_pts
+                    ),
+                    "sq9_modifier_delta": sq9_delta,
+                    "sq9_next_target_dist": (
+                        round(target.price - sq.spot, 2) if target is not None else None
+                    ),
+                }
+            )
+
+        # Task-4 measurement — the validation surface for the new #1 confluence:
+        # conviction strength/tier + liqRej at entry, which inputs were degraded,
+        # and where price stood relative to the persistent zone structure.
+        cv = self.conviction_reading
+        if cv is not None:
+            context.update(
+                {
+                    "conv_signed": cv.conv_signed,
+                    "conv_tier": cv.tier,
+                    "conv_fire": bool(cv.fire_bull or cv.fire_bear),
+                    "liq_rej": (
+                        "BULL" if cv.liq_rej_bull
+                        else "BEAR" if cv.liq_rej_bear else None
+                    ),
+                    "conv_degraded": len(cv.degraded),
+                }
+            )
+        zr = self.zone_reading
+        if zr is not None:
+            rz = zr.relation_zone
+            context.update(
+                {
+                    "zone_relation": zr.relation,
+                    "zone_state": rz.state if rz is not None else None,
+                    "zone_touches": rz.touches if rz is not None else None,
+                    "zone_effective": rz.effective if rz is not None else None,
+                    "zones_active": zr.n_active,
+                }
+            )
+
         # GEX-map measurement — grade by the cell price occupied, the position_state,
         # and whether the verdict AGREED with the structural prior. This is how the
         # journal validates that map-first ranking earns its place: does
@@ -1091,6 +1217,36 @@ async def cmd_gex(ctx: commands.Context) -> None:
         await ctx.send("No chain snapshot yet — engine warming up.")
         return
     await ctx.send(embed=embeds.gex_snapshot_embed(bot.profile))
+
+
+@commands.command(name="sq9")
+async def cmd_sq9(ctx: commands.Context) -> None:
+    """!sq9 — post the Gann Square-of-9 lattice board (modifier + exit grid)."""
+    bot: HelenusBot = ctx.bot  # type: ignore[assignment]
+    if bot.sq9_reading is None:
+        await ctx.send("No Sq9 lattice yet — engine warming up (or Sq9Config.enabled off).")
+        return
+    await ctx.send(embed=embeds.sq9_snapshot_embed(bot.sq9_reading))
+
+
+@commands.command(name="conv")
+async def cmd_conv(ctx: commands.Context) -> None:
+    """!conv — post the displacement-conviction oscillator board."""
+    bot: HelenusBot = ctx.bot  # type: ignore[assignment]
+    if bot.conviction_reading is None:
+        await ctx.send("No conviction read yet — engine warming up (or disabled).")
+        return
+    await ctx.send(embed=embeds.conviction_snapshot_embed(bot.conviction_reading))
+
+
+@commands.command(name="zones")
+async def cmd_zones(ctx: commands.Context) -> None:
+    """!zones — post the displacement zone/FVG lifecycle board."""
+    bot: HelenusBot = ctx.bot  # type: ignore[assignment]
+    if bot.zone_reading is None:
+        await ctx.send("No zone read yet — engine warming up (or disabled).")
+        return
+    await ctx.send(embed=embeds.zones_snapshot_embed(bot.zone_reading))
 
 
 @commands.command(name="charm")

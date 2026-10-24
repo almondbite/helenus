@@ -15,8 +15,11 @@ Covers the two range-day trigger fixes:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+from contextlib import contextmanager
 
+from helenus.config import CONFIG
 from helenus.engine.gex import GexProfile
 from helenus.engine.scan2 import (
     Bar,
@@ -24,6 +27,32 @@ from helenus.engine.scan2 import (
     TriggerType,
     detect_candidate,
 )
+
+
+@contextmanager
+def legacy_gex():
+    """Pin the LEGACY GEX mode (levels_in_signal=True) for fixtures that exercise
+    the wall/zero-Γ level machinery Task 1 decoupled by default. CONFIG is a
+    frozen dataclass shared by every module, so swap the gex section in place."""
+    old = CONFIG.gex
+    object.__setattr__(CONFIG, "gex", dataclasses.replace(old, levels_in_signal=True))
+    try:
+        yield
+    finally:
+        object.__setattr__(CONFIG, "gex", old)
+
+
+@contextmanager
+def legacy_scalp():
+    """Pin the LEGACY scalp mode (confluence_5m=False) — Task 2 promotes the EMA
+    ignition above the flow triggers, so the old flow-first precedence only
+    exists here. The 5m ordering is covered in tests/test_scalp5m.py."""
+    old = CONFIG.scalp
+    object.__setattr__(CONFIG, "scalp", dataclasses.replace(old, confluence_5m=False))
+    try:
+        yield
+    finally:
+        object.__setattr__(CONFIG, "scalp", old)
 
 
 def _bar(c: float, h: float | None = None, l: float | None = None, v: float = 100.0) -> Bar:
@@ -75,7 +104,8 @@ def test_key_levels_injects_walls_and_zero_gamma() -> None:
         put_walls=[(7430.0, -4e8)],
         zero_gamma=7442.0,
     )
-    by_label = {lv.label: lv for lv in st.key_levels(7445.0, gex)}
+    with legacy_gex():
+        by_label = {lv.label: lv for lv in st.key_levels(7445.0, gex)}
     assert by_label["Call Wall 7460"].price == 7460.0
     assert by_label["Put Wall 7430"].price == 7430.0
     assert by_label["Zero-Γ"].price == 7442.0
@@ -100,7 +130,8 @@ def test_volume_cross_fires_on_a_put_wall_off_grid() -> None:
     st.push_bar(_bar(7451.0, v=100.0))                       # prev: just below wall
     st.push_bar(_bar(7453.0, v=400.0))                       # cur: crosses 7452 up
 
-    cand = detect_candidate(st, _gex(spot=7453.0, put_walls=[(7452.0, -4e8)]))
+    with legacy_gex():
+        cand = detect_candidate(st, _gex(spot=7453.0, put_walls=[(7452.0, -4e8)]))
     assert cand is not None
     assert cand.trigger is TriggerType.VOLUME_CONFIRMATION
     assert "Put Wall 7452" in cand.reason
@@ -228,7 +259,8 @@ def test_regime_flip_crossing_up() -> None:
     st = MarketState()
     st.push_bar(_bar(7405.0))                 # below zero-Γ
     st.push_bar(_bar(7415.0))                 # crosses up through 7410
-    cand = detect_candidate(st, _gex(spot=7415.0, zero_gamma=7410.0))
+    with legacy_gex():
+        cand = detect_candidate(st, _gex(spot=7415.0, zero_gamma=7410.0))
     assert cand is not None
     assert cand.trigger is TriggerType.REGIME_FLIP
     assert "up" in cand.reason and "POSITIVE_GAMMA" in cand.reason
@@ -238,7 +270,8 @@ def test_regime_flip_crossing_down() -> None:
     st = MarketState()
     st.push_bar(_bar(7415.0))
     st.push_bar(_bar(7405.0))                 # crosses down through 7410
-    cand = detect_candidate(st, _gex(spot=7405.0, zero_gamma=7410.0))
+    with legacy_gex():
+        cand = detect_candidate(st, _gex(spot=7405.0, zero_gamma=7410.0))
     assert cand is not None
     assert cand.trigger is TriggerType.REGIME_FLIP
     assert "down" in cand.reason and "NEGATIVE_GAMMA" in cand.reason
@@ -329,15 +362,17 @@ def _scalp_stub(active=False):
 
 
 def test_vanna_outranks_ema_ignition() -> None:
-    # No regime flip (zero-Γ far away); both vanna and an EMA ignition are live —
-    # the primary flow trigger wins (ranked #2, ahead of EMA at #3).
+    # LEGACY precedence: both vanna and an EMA ignition are live — the flow
+    # trigger wins. (Task 2 flips this: the promoted 5m scalp outranks flow —
+    # see tests/test_scalp5m.py.)
     st = MarketState()
     st.push_bar(_bar(7445.0))
     st.push_bar(_bar(7446.0))
-    cand = detect_candidate(
-        st, _gex(spot=7446.0, zero_gamma=7600.0),
-        vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
-    )
+    with legacy_scalp():
+        cand = detect_candidate(
+            st, _gex(spot=7446.0, zero_gamma=7600.0),
+            vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
+        )
     assert cand is not None and cand.trigger is TriggerType.VANNA_RALLY
 
 
@@ -346,10 +381,11 @@ def test_regime_flip_outranks_vanna() -> None:
     st = MarketState()
     st.push_bar(_bar(7405.0))                     # below the pivot
     st.push_bar(_bar(7415.0))                     # crosses zero-Γ 7410 up
-    cand = detect_candidate(
-        st, _gex(spot=7415.0, zero_gamma=7410.0),
-        vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
-    )
+    with legacy_gex():
+        cand = detect_candidate(
+            st, _gex(spot=7415.0, zero_gamma=7410.0),
+            vanna=_vanna_stub(active=True), scalp=_scalp_stub(active=True),
+        )
     assert cand is not None and cand.trigger is TriggerType.REGIME_FLIP
 
 

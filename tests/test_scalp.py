@@ -1,4 +1,4 @@
-"""
+﻿"""
 Offline tests for engine/scalp.py — the 1m 5/9 EMA-ignition contract scalp.
 
 No network, no Schwab key. Runs under pytest *or* standalone:
@@ -14,6 +14,7 @@ dual-bleed / spread), contract selection, and the level→premium translation.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import math
 
@@ -40,6 +41,12 @@ from helenus.engine.scalp import (
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
+
+# Task-2 pin: these fixtures encode the LEGACY 1m/OTM semantics (per-1m-bar
+# evaluation, 0.35Δ OTM strikes). The engine/selection capture the cfg they're
+# given, so passing this explicitly pins the mode without touching CONFIG. The
+# 5m/ITM mode has its own suite: tests/test_scalp5m.py.
+LEGACY = dataclasses.replace(CONFIG.scalp, confluence_5m=False)
 
 _T0 = dt.datetime(2026, 6, 22, 13, 0, tzinfo=ET)
 
@@ -150,7 +157,7 @@ def test_reclaim_off_a_local_bottom() -> None:
     # Rise to set 5>9, dip below the 5 EMA, then reclaim it on the final bar —
     # WITHOUT a fresh 5/9 cross (the higher-quality reclaim variant).
     closes = list(range(4990, 5012)) + [5006, 5009]
-    st, eng = MarketState(), ScalpEngine()
+    st, eng = MarketState(), ScalpEngine(LEGACY)
     reading = None
     for b in _bars(closes):
         st.push_bar(b)
@@ -165,8 +172,8 @@ def test_reclaim_off_a_local_bottom() -> None:
 
 def test_select_picks_nearest_target_delta_on_the_right_side() -> None:
     contracts = extract_contracts(_chain())
-    call = select_target_contract(contracts, 5001.0, Direction.BULLISH)
-    put = select_target_contract(contracts, 5001.0, Direction.BEARISH)
+    call = select_target_contract(contracts, 5001.0, Direction.BULLISH, LEGACY)
+    put = select_target_contract(contracts, 5001.0, Direction.BEARISH, LEGACY)
     assert call is not None and call.side == "call" and call.strike == 5010
     assert put is not None and put.side == "put" and put.strike == 4990
 
@@ -216,11 +223,11 @@ def test_bleeding_detects_lower_highs_and_lower_lows() -> None:
 
 def test_premium_divergence_bullish() -> None:
     # Index makes a lower low while the ATM call premium makes a higher low.
-    st, eng = MarketState(), ScalpEngine()
+    st, eng = MarketState(), ScalpEngine(LEGACY)
     for b in _bars(list(range(5010, 4994, -1))):           # index grinding lower
         st.push_bar(b)
     eng._atm_call.extend([2.0, 1.8, 1.6, 1.9, 2.1, 2.3])   # call carving a higher low
-    assert eng._premium_divergence(st, Direction.BULLISH)
+    assert eng._premium_divergence(list(st.bars), Direction.BULLISH)
 
 
 # --------------------------------------------------------------------------- #
@@ -228,7 +235,7 @@ def test_premium_divergence_bullish() -> None:
 # --------------------------------------------------------------------------- #
 
 def _run(closes, gex, vanna, *, heavy_tail=6, chain=None) -> "object":
-    st, eng = MarketState(), ScalpEngine()
+    st, eng = MarketState(), ScalpEngine(LEGACY)
     if chain is not None:
         eng.on_chain(chain, chain["underlying"]["mark"])
     reading = None
@@ -266,7 +273,7 @@ def test_gated_on_vanna_headwind() -> None:
 
 def test_gated_in_chop() -> None:
     # Seed three recent crosses so the chop counter trips on this bar's cross.
-    st, eng = MarketState(), ScalpEngine()
+    st, eng = MarketState(), ScalpEngine(LEGACY)
     eng.on_chain(_chain(), 5001.0)
     bars = _bars(_CROSS_UP_CLOSES, heavy_tail=6)
     final_ts = bars[-1].ts
@@ -297,7 +304,7 @@ def test_gated_on_insufficient_room() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_no_bars_is_inactive() -> None:
-    r = ScalpEngine().on_bar(MarketState(), None, None, None)
+    r = ScalpEngine(LEGACY).on_bar(MarketState(), None, None, None)
     assert not r.active and r.direction is None
 
 
@@ -310,7 +317,7 @@ def test_no_contract_blocks_active() -> None:
 
 def test_warm_seeds_emas_without_reprocessing() -> None:
     bars = _bars(_CROSS_UP_CLOSES)
-    eng = ScalpEngine()
+    eng = ScalpEngine(LEGACY)
     eng.warm(bars)
     assert eng.ema.fast.value is not None
     # A re-run of the last bar must be a no-op (dedupe on timestamp).

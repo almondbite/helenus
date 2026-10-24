@@ -1,0 +1,23 @@
+[
+  {"query": "I have an idea for a gap-fill trigger, where do we start", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "should we add an opening-drive continuation signal?", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "saw a tradingview indicator that looks great, port it in?", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "promote the liq_reject trigger above displacement", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "the approach arm seems useless, retire it?", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "what stage is the sq9 modifier at right now", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "can we skip the replay step, the fixtures are thorough", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "new filter idea: skip longs when breadth diverges - process?", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "how did the confluence rework engines get from idea to code", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "make the vanna inflection a full trigger not just an arm", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "what journal fields should my new engine write for later validation", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "when is it legit to turn a provisional flag into a permanent default", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "I built the thing, what's between me and it being weighted", "should_trigger": true, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "does my proposal count as evidence tier 3", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "run the back-tag for the rework validation", "should_trigger": false, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "was a breadth filter tried before?", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "what's the flag-gating convention in code", "should_trigger": false, "expected_skill": "helenus-change-control"},
+  {"query": "brainstorm startup ideas with me", "should_trigger": false, "expected_skill": null},
+  {"query": "how do dealers hedge charm", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "write a unit test for this function in my other repo", "should_trigger": false, "expected_skill": null},
+  {"query": "what open problems are worth working on next quarter", "should_trigger": false, "expected_skill": "helenus-research-frontier"}
+]

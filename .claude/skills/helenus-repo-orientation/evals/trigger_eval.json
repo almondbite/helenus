@@ -1,0 +1,23 @@
+[
+  {"query": "what is this project actually doing? just landed in the repo", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "how does helenus work end to end, from schwab to discord?", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "where does the candidate gate live?", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "which file computes gex walls", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "give me a tour of the codebase before we start", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "is the README accurate? it mentions a venv", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "whats in the journal folder and can I edit it", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "what do the pine_files have to do with anything", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "I need to add a field to the moc engine, where is it and what should i know first", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "whats the difference between scan2 and the other engines", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "which docs can I trust here vs whats stale", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "does this bot place actual trades??", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "new session, continuing from yesterday - what was the state of things", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "why is there an uncommitted 1500-line diff sitting here", "should_trigger": true, "expected_skill": "helenus-repo-orientation"},
+  {"query": "run the gex tests for me", "should_trigger": false, "expected_skill": "helenus-build-test-env"},
+  {"query": "why did no alerts fire this morning", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "can I make sq9 levels fire entries directly", "should_trigger": false, "expected_skill": "helenus-architecture-contract"},
+  {"query": "format this markdown table", "should_trigger": false, "expected_skill": null},
+  {"query": "explain what vanna means", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "write a python script that parses a csv", "should_trigger": false, "expected_skill": null},
+  {"query": "what's a good git branching strategy in general?", "should_trigger": false, "expected_skill": null}
+]

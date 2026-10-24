@@ -1,0 +1,23 @@
+[
+  {"query": "continue the confluence rework", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "let's validate the sq9 modifier finally", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "back-tag the historical alerts with the new fields", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "what min_score should zones use? 35 seems arbitrary", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "is 0.65 the right itm delta target", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "compute per-confluence expectancy from the journal", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "should step_degrees drop to 22.5 for 0dte exits", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "finalize the weights for the new confluence stack", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "whats left on the rework? tasks 1-4 are done right", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "does the conviction fire_line of 60 hold up in the data", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "the sq9 entries dont seem to grade better - demote it?", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "write the validation report for the owner", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "can I just set min_score=50 based on the replay spawn counts", "should_trigger": true, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "build a brand new displacement variant", "should_trigger": false, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "what does the sq9 math actually compute", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "test_zones is failing", "should_trigger": false, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "what counts as validated around here in general", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "plan my vacation itinerary", "should_trigger": false, "expected_skill": null},
+  {"query": "why is the working tree full of uncommitted changes", "should_trigger": false, "expected_skill": "helenus-repo-orientation"},
+  {"query": "add a confluence for market breadth", "should_trigger": false, "expected_skill": "helenus-signal-lifecycle"},
+  {"query": "optimize this sql query", "should_trigger": false, "expected_skill": null}
+]

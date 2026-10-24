@@ -1,0 +1,23 @@
+[
+  {"query": "no alerts fired all morning, is the gate broken?", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "!stream shows the ES feed 400s stale", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "schwab is returning 400 on the chain call", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "gex walls look totally wrong today (it's expiration friday)", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "volume numbers are insane, like 10x what they should be", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "vix1d is spiking at 3:45 but nothing is happening in the market??", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "session high/low are wrong after I restarted the bot midday", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "alerts fired but never got graded", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "embeds arent showing up in the channel", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "timestamps in the journal are off by 4 hours", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "the regime flip keeps posting these grey embeds, is that a bug", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "bot went quiet in premarket, data starved?", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "the moc capitulation never sees wicks, feed problem?", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "something looks wrong with the scalp board but idk what", "should_trigger": true, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "test_flow.py assertion failed after my edit", "should_trigger": false, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "ImportError running the tests", "should_trigger": false, "expected_skill": "helenus-build-test-env"},
+  {"query": "why is charm supportive in the afternoon", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "my react app won't compile", "should_trigger": false, "expected_skill": null},
+  {"query": "did we ever try an ES imbalance veto", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "what would the gate have fired on yesterday's tape", "should_trigger": false, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "debug this segfault in my c++ program", "should_trigger": false, "expected_skill": null}
+]

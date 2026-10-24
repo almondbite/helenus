@@ -78,6 +78,22 @@ class GexConfig:
     contract_multiplier: int = 100
     wall_top_n: int = 3                 # how many gamma walls to surface per side
     min_oi: int = 10                    # drop dust strikes before aggregation
+    # GEX-decoupling contract (Task 1 of the confluence rework). GEX is computed
+    # and DISPLAYED every cycle regardless (!gex board, MOC briefing, !scan map
+    # line, journal measurement tags) — this flag only controls whether GEX
+    # LEVELS (walls, the zero-Γ flip price, room-to-magnet distances) participate
+    # in the SIGNAL path:
+    #   False (default) — GEX levels are a MANUAL read-out only. They are absent
+    #     from the key-level grid, the Claude snapshot/prompt, the approach arms,
+    #     and every map gate/veto; the zero-Γ cross posts a muted, unscored info
+    #     embed instead of a scored REGIME_FLIP alert. Gamma SIGN survives as a
+    #     lightweight regime-router LABEL (momentum vs reversion) — it labels,
+    #     it does not score.
+    #   True — legacy behavior, fully restored: walls/zero-Γ in the grid, the
+    #     scored REGIME_FLIP trigger, magnet distances + wall room rules in the
+    #     analyst, and the gexmap gating (when gexmap.enabled). Kept for
+    #     comparison/rollback while the new stack is validated.
+    levels_in_signal: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,9 +198,10 @@ class FlowConfig:
 
 @dataclass(frozen=True)
 class ScalpConfig:
-    """The 1m 5/9 EMA momentum-ignition scalp — Helenus's contract-scalp confluence.
+    """The 5/9 EMA momentum-ignition scalp — Helenus's contract-scalp confluence
+    (5-minute bars + ITM contracts under `confluence_5m`, the default; 1m/OTM legacy).
 
-    Replicates a visual 0DTE strategy: go long when the contract's 1m 5 EMA
+    Replicates a visual 0DTE strategy: go long when the contract's 5 EMA
     crosses above the 9 EMA (or reclaims the 5 EMA off a local bottom), targeting
     a structural level pre-translated into option premium. The raw cross is noisy,
     so it is treated as the *trigger* and wrapped in a gated confirmation stack
@@ -194,11 +211,32 @@ class ScalpConfig:
     See helenus/engine/scalp.py."""
     ema_fast: int = 5
     ema_slow: int = 9
-    ema_trend: int = 200                # dynamic floor/ceiling EMA
-    # OTM strike selection: target |delta| and the acceptable window around it.
+    ema_trend: int = 200                # dynamic floor/ceiling EMA (legacy 1m mode)
+    # --- Task-2: the 5-minute / ITM PRIMARY-confluence mode -------------------
+    # True (default): ALL ignition/cross/bar-close logic runs on 5-MINUTE bars
+    # folded from the 1m tape, the contract leg targets ITM strikes only, and the
+    # confluence is promoted ABOVE the flow/vanna triggers in the candidate gate
+    # (see scan2.detect_candidate). The 5m read confirms LATER than 1m — more
+    # lag, less noise — an intentional trade of earliness for reliability; that
+    # reliability is what buys the primary weight. False restores the legacy
+    # 1m/OTM behavior exactly.
+    confluence_5m: bool = True
+    bar_minutes: int = 5                # scalp bar timeframe under confluence_5m
+    # ITM strike selection (calls at/below spot, puts at/above): target |delta| +
+    # band. ITM premium tracks the index closer to 1:1 and bleeds less to
+    # theta/vega than the legacy 0.35Δ OTM pick.
+    itm_target_delta: float = 0.65
+    itm_delta_band: float = 0.15
+    # Trend EMA under confluence_5m: 40 × 5m ≈ the same wall-clock line as the
+    # legacy 200 × 1m (a literal 200 × 5m could never mature inside a 390-minute
+    # session, silently killing the dynamic floor/ceiling role).
+    ema_trend_5m: int = 40
+    # OTM strike selection (legacy mode): target |delta| and the window around it.
     target_delta: float = 0.35
     delta_band: float = 0.15
-    # Chop counter — N+ 5/9 crosses inside the window is a chop signature: stand down.
+    # Chop counter — N+ 5/9 crosses inside the window is a chop signature: stand
+    # down. The window scales with the bar timeframe (×bar_minutes under
+    # confluence_5m: 5 → 25 min), since 5m crosses print ~5× less often.
     chop_window_min: int = 5
     chop_max_crosses: int = 3
     # Room to the nearest structural target in the trade direction (index points).
@@ -488,7 +526,12 @@ class GexMapConfig:
     Default OFF so current behavior is exactly preserved until flipped on — the state
     model, the snapshot blocks, and the gating are all dormant while disabled (the
     Measurement task validates on the journal first). See gexmap.py, scan2 (the
-    pre-Claude gate), and analyst.py (the leading snapshot blocks + post-verdict OFF)."""
+    pre-Claude gate), and analyst.py (the leading snapshot blocks + post-verdict OFF).
+
+    NOTE (Task-1 GEX decoupling): the map's prior/gate is wholly LEVEL-based, so
+    while GexConfig.levels_in_signal is False the map cannot gate/veto/pre-load even
+    with this flag on — it degrades to its display (!scan) and journal-measurement
+    roles, which validate the manual-read ranking."""
     enabled: bool = False
     # Spot within this of a wall / zero-Γ reads as PINNED_AT_WALL (reuses the
     # scan "at a level" tolerance).
@@ -509,6 +552,136 @@ class GexMapConfig:
     # "Approaching" tolerance for APPROACHING_WALL / APPROACHING_FLIP and the
     # map-driven arm (reuses ApproachConfig.approach_pts semantics).
     approach_pts: float = 7.0
+
+
+@dataclass(frozen=True)
+class ConvictionConfig:
+    """Displacement conviction oscillator — the MATH ported from the Pine
+    'Displacement Oscillator v6' (formulas only, never the Pine): a signed
+    −100..+100 conviction score per bar (weighted base + quality boost), the
+    fire gate, and the liqRej sweep-reject reversal. An INPUT to Helenus's
+    structural scoring, not a standalone brain: the score ENRICHES candidates
+    (displacement notes + Claude's snapshot + the journal); only LIQ_REJECT —
+    the sweep-of-prior-extreme that closes back inside, the documented
+    personal-edge piece — initiates its own gate candidate, and Claude still
+    judges it. Defaults are the Pine auto-cal 'scalp' (≤3-min chart) values,
+    matching the 1m tape.
+
+    VOLUME REWIRING (raw SPX volume is garbage): bar volume = the SPY proxy
+    already on MarketState bars (with Pine's own useVol=false fallback, 0.6×
+    weight, while the baseline is cold); order-flow delta = ES cumulative-delta
+    interval diffs (engine/cumdelta via the /ES stream) — sDelta scores 0 and is
+    flagged `degraded` when the stream is off. Other explicit degrades:
+    hvBodyAdj=1.0 (needs a 252-day HV rank), structure break = intraday pivot
+    only (no prior-day H/L history), MTF ladder = 1m native + 5m/15m folds
+    (60m/D unsourceable intraday; folded biases read 0 until their EMAs warm).
+    See helenus/engine/conviction.py."""
+    enabled: bool = True
+    length: int = 14                    # baseline lookback (body/vol SMA, ATR, sweep window)
+    flow_len: int = 14                  # net-flow display window (ES-delta sum)
+    body_mult: float = 1.2              # displacement-candle body threshold (× avg body)
+    atr_mult: float = 1.1               # range expansion threshold (× ATR)
+    close_thresh: float = 0.58          # close-position conviction threshold
+    fire_line: float = 60.0             # score needed to FIRE (Balanced sensitivity)
+    cooldown_bars: int = 4              # min bars between same-direction fires
+    ema_fast: int = 8
+    ema_mid: int = 21
+    ema_slow: int = 50
+    rsi_len: int = 14
+    vol_mult: float = 1.3               # relVol threshold in sVol
+    hv_len: int = 20                    # realized-vol lookback (log returns)
+    atr_regime_len: int = 50            # ATR-expansion regime baseline
+    atr_regime_mult: float = 1.2
+    squeeze_len: int = 20               # TTM-style squeeze (BB vs Keltner)
+    squeeze_bb_mult: float = 2.0
+    squeeze_kc_mult: float = 1.5
+    mtf_filter: bool = True             # block counter-trend fires on the MTF ladder
+    mtf_block_sum: int = 2              # |ladder sum| that blocks an opposing fire
+
+
+@dataclass(frozen=True)
+class ZoneConfig:
+    """Displacement zone lifecycle — the MATH ported from the Pine
+    'Displacement Zones [Volatility Engine] v6' (formulas only): the 8-component
+    spawn score (weights 18/18/12/12/10/12/10/8 = 100), the zone STATE MACHINE
+    (ACTIVE → TESTED → MITIGATED / BROKEN with touch counts and half-life age
+    decay), and the FVG lifecycle (OPEN → CE(50%) → FILLED). Zones are
+    persistent structure Helenus maintains across bars — queryable
+    (approaching / testing / mitigating) for the approach-arm logic and Claude's
+    snapshot. Zone edges are deliberately NOT key levels: no trigger initiates
+    at one.
+
+    Explicit degrades (each flagged in the reading): cVol = 0.5 neutral while
+    the SPY-proxy baseline is cold; cRegime (VIX 252-day rank), cMtf (a 60m
+    displacement baseline that can never warm intraday), and cVrp (index − daily
+    RV) all pin to Pine's own 0.5 not-applicable midpoint. Touch counting ports
+    the INTENT — one count per DISTINCT entry into the zone — rather than Pine's
+    first-touch-only quirk. See helenus/engine/zones.py."""
+    enabled: bool = True
+    length: int = 20                    # baseline lookback (avg body / ATR / vol)
+    body_mult: float = 1.2
+    atr_mult: float = 1.2
+    close_thresh: float = 0.55
+    vol_mult: float = 1.3
+    min_score: float = 35.0             # spawn threshold (Pine's uncalibrated default)
+    max_zones: int = 10                 # FIFO cap on tracked zones
+    decay_bars: int = 60                # score half-life in bars (age decay)
+    overlap_filter: bool = True         # skip a spawn overlapping a live same-side zone
+    max_fvg: int = 15                   # FIFO cap on tracked FVGs
+    # "Approaching" distance for the relation query (approach-arm integration).
+    approach_pts: float = 7.0
+
+
+@dataclass(frozen=True)
+class Sq9Config:
+    """Gann Square-of-9 — a DETERMINISTIC LEVEL LATTICE in exactly two honest
+    roles, and no others:
+
+      (a) CONFLUENCE MODIFIER. A ring level only AMPLIFIES or DAMPENS a signal
+          that originated ELSEWHERE (displacement / scalp / structure), and only
+          when price REACTS at the level — a tag-and-hold with a real wick, not
+          mere proximity. Coincidence with other structure (a ring landing on an
+          MSS break / charm wall / session extreme) strengthens the shelf.
+          Sq9 NEVER initiates (its levels stay OUT of scan2's key-level grid, so
+          no trigger can fire at one) and NEVER vetoes (the dampen is a bounded
+          subtraction; no suppression path exists).
+      (b) EXIT / TARGET GRID. The next ring above/below an open position is a
+          pre-computed, deterministic profit-target and structural-stop
+          reference — the exit-discipline fix: mechanical targets that need no
+          mid-trade judgment. Attached to every alert's notes.
+
+    The math is pure arithmetic: a full 360° rotation advances √price by 2, so
+    level(θ) = (√anchor ± 2·θ/360)². Reproducible from (anchor, step, rotations)
+    alone. Gann angles/fans (anchor+scale dependent) and time cycles are
+    deliberately NOT implemented.
+
+    The amplify/dampen weights are PROVISIONAL until the validation phase
+    back-tags the journal (sq9_* fields are recorded on every alert for that);
+    if Sq9-at-entry grades marginal, set modifier_enabled=False to demote it to
+    manual-read-only without losing the grid, board, or exit references."""
+    enabled: bool = True                # grid + !sq9 board + snapshot + tagging + exit grid
+    modifier_enabled: bool = True       # the scoring half (amplify/dampen) only
+    # Anchor source: session_open | prior_close | session_low | session_high.
+    # session_open (default) fixes the lattice at the 09:30 first bar — stable
+    # and reproducible all session; the extreme kinds re-anchor deterministically
+    # when a new extreme prints (the swing-pivot role).
+    anchor: str = "session_open"
+    # Ring layout: levels every step_degrees, out to rotations×360° each way.
+    # 45° honors the brief's 45/90/…/360 lattice (~43pt per step at SPX 7400);
+    # validation may prefer 22.5/11.25 for 0DTE-sized exit distances.
+    step_degrees: float = 45.0
+    rotations: float = 1.0
+    # Reaction gate (reaction/hold > proximity): the bar must TAG the ring within
+    # tolerance and close back off it with at least this much wick.
+    tolerance_pts: float = 1.5
+    reaction_wick_pts: float = 2.0
+    # Structure coincidence: ring within this of the candidate's own level.
+    coincide_pts: float = 2.0
+    # Provisional modifier weights (bounded; never a veto).
+    amplify_pts: float = 6.0            # fresh aligned reaction at a ring
+    coincide_bonus_pts: float = 3.0     # …that ring also coincides with structure
+    dampen_pts: float = 4.0             # verdict into a nearby ring that has REACTED
+    dampen_within_pts: float = 5.0      # "nearby" for the dampen check
 
 
 @dataclass(frozen=True)
@@ -554,6 +727,9 @@ class HelenusConfig:
     approach: ApproachConfig = field(default_factory=ApproachConfig)
     es_lead: ESLeadConfig = field(default_factory=ESLeadConfig)
     gexmap: GexMapConfig = field(default_factory=GexMapConfig)
+    sq9: Sq9Config = field(default_factory=Sq9Config)
+    conviction: ConvictionConfig = field(default_factory=ConvictionConfig)
+    zones: ZoneConfig = field(default_factory=ZoneConfig)
 
 
 CONFIG = HelenusConfig()

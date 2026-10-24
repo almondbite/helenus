@@ -1,0 +1,23 @@
+[
+  {"query": "can we add sq9 rings to the key level grid so rejections fire there", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "I want to make charm.py async so it matches bot.py", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "why can't the gex map just fire the entry itself when price hits a wall", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "review this diff to scan2's precedence order", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "let claude recompute the gamma numbers, it's smart enough", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "wouldn't it be simpler to collapse the legacy/5m branches now", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "what are the invariants I can't break when touching the engines", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "planning a new engine for opening gaps - what's the design contract", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "can zones veto a candidate directly", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "is it ok for cumdelta to read a file for persistence", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "why does the bot call claude so rarely, can we call it every bar", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "the stream is down, should engines just throw?", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "where should the new reading's missing-input behavior go, fake a neutral?", "should_trigger": true, "expected_skill": "helenus-architecture-contract"},
+  {"query": "does moving lessons into the cached prompt section break anything", "should_trigger": false, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "what does positive gamma mean for dealer behavior", "should_trigger": false, "expected_skill": "helenus-market-domain-reference"},
+  {"query": "which file is the discord loop in", "should_trigger": false, "expected_skill": "helenus-repo-orientation"},
+  {"query": "why did the sweep trigger not fire at 2pm", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "design a rest api for my todo app", "should_trigger": false, "expected_skill": null},
+  {"query": "is 8pt of room enough for shorts into put walls", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "refactor this list comprehension", "should_trigger": false, "expected_skill": null},
+  {"query": "what's the process for getting my change approved", "should_trigger": false, "expected_skill": "helenus-change-control"}
+]

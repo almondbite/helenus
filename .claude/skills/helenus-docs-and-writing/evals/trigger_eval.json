@@ -1,0 +1,23 @@
+[
+  {"query": "update lessons.md with what we learned today", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "the README is stale, rewrite it for the rework", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "how do I mark that the es-imbalance lesson was corrected", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "clean up lessons.md, it's getting long and repetitive", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "write the validation report - what format", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "can I write 'verified' in the summary for this", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "draft a review record for today's session", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "what status words are allowed without evidence", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "document the new zone engine in the readme", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "found doc drift in the scalp section, fix or report?", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "add the alert ids to this lessons claim", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "why does lessons.md matter so much, it's just notes right", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "memo for the owner on the sq9 findings - structure it", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "delete the superseded tuning notes from lessons", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "does the evidence actually support this lesson", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "which lessons came from which alerts historically", "should_trigger": false, "expected_skill": "helenus-failure-archaeology"},
+  {"query": "will editing lessons.md bust the prompt cache", "should_trigger": false, "expected_skill": "helenus-analyst-prompting"},
+  {"query": "write a blog post about options trading", "should_trigger": false, "expected_skill": null},
+  {"query": "fix this typo in my cover letter", "should_trigger": false, "expected_skill": null},
+  {"query": "is editing journal/helenus.jsonl ever ok", "should_trigger": true, "expected_skill": "helenus-docs-and-writing"},
+  {"query": "proofread this docstring grammar", "should_trigger": false, "expected_skill": null}
+]

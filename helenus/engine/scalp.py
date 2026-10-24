@@ -1,13 +1,21 @@
 """
-EMA Ignition — the 1m 5/9 0DTE contract-scalp confluence.
+EMA Ignition — the 5/9 0DTE contract-scalp confluence, a PRIMARY confluence.
 
-Replicates a visual scalping strategy: go long when the option contract's 1m
+Replicates a visual scalping strategy: go long when the option contract's
 **5 EMA crosses above the 9 EMA** (or reclaims the 5 EMA off a local bottom),
-targeting a structural level pre-translated into option premium; the 200 EMA acts
-as a dynamic floor/ceiling. The literal edge is that charting the contract
+targeting a structural level pre-translated into option premium; the trend EMA
+acts as a dynamic floor/ceiling. The literal edge is that charting the contract
 front-runs the index and visualizes "gamma ignition." The weakness is that the
 raw 5/9 cross is NOISY — it whipsaws in chop, high-positive-GEX pins, and vanna
 (vol-crush) tape.
+
+TIMEFRAME (Task 2 of the confluence rework). Under `ScalpConfig.confluence_5m`
+(the default) ALL ignition/cross/bar-close logic runs on **5-MINUTE bars** folded
+from the 1m tape, and the contract leg targets **ITM strikes only**. The 5m read
+confirms LATER than the old 1m read — more lag, less noise — an intentional
+trade of earliness for reliability: a cross that survives the coarser timeframe
+is the version worth a PRIMARY confluence weight (it now outranks the flow/vanna
+triggers in scan2's gate). `confluence_5m=False` restores the 1m/OTM legacy.
 
 So the cross is treated as the *trigger, not the edge — the edge is the
 filtering*. This module wraps it in a gated confirmation stack and reuses the
@@ -221,20 +229,29 @@ def select_target_contract(
     direction: Direction,
     cfg: ScalpConfig | None = None,
 ) -> ContractQuote | None:
-    """The slightly-OTM strike whose |delta| is closest to `target_delta` on the
-    correct side — calls above spot for a long, puts below spot for a short."""
+    """The trade-plan strike whose |delta| is closest to the mode's target delta.
+
+    Under `confluence_5m` (Task 2) the leg is ITM-ONLY — calls at/below spot for
+    a long, puts at/above spot for a short, |delta| near `itm_target_delta`
+    (~0.65): premium tracks the index closer to 1:1 and bleeds less to
+    theta/vega. Legacy picks the slightly-OTM ~0.35Δ strike — calls above spot,
+    puts below."""
     cfg = cfg or CONFIG.scalp
     want = "call" if direction is Direction.BULLISH else "put"
-    otm = [
+    if cfg.confluence_5m:
+        side_ok = (lambda c: c.strike <= spot) if want == "call" else (lambda c: c.strike >= spot)
+        target, band = cfg.itm_target_delta, cfg.itm_delta_band
+    else:
+        side_ok = (lambda c: c.strike > spot) if want == "call" else (lambda c: c.strike < spot)
+        target, band = cfg.target_delta, cfg.delta_band
+    pool = [
         c
         for c in contracts
-        if c.side == want
-        and (c.strike > spot if want == "call" else c.strike < spot)
-        and abs(abs(c.delta) - cfg.target_delta) <= cfg.delta_band
+        if c.side == want and side_ok(c) and abs(abs(c.delta) - target) <= band
     ]
-    if not otm:
+    if not pool:
         return None
-    return min(otm, key=lambda c: abs(abs(c.delta) - cfg.target_delta))
+    return min(pool, key=lambda c: abs(abs(c.delta) - target))
 
 
 def premium_target(
@@ -365,46 +382,130 @@ class ScalpEngine:
 
     def __init__(self, cfg: ScalpConfig | None = None) -> None:
         self.cfg = cfg or CONFIG.scalp
-        self.ema = EmaTracker(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.ema_trend)
+        # Trend EMA: 40 × 5m ≈ the wall-clock 200 × 1m line (a literal 200 × 5m
+        # would never mature intraday — see ScalpConfig.ema_trend_5m).
+        trend = self.cfg.ema_trend_5m if self.cfg.confluence_5m else self.cfg.ema_trend
+        self.ema = EmaTracker(self.cfg.ema_fast, self.cfg.ema_slow, trend)
         self.chop = ChopTracker()
-        # ATM-wing premium series for the dual-bleed read, plus their own 5/9 EMAs
-        # for the gamma-ignition front-run (premium cross leads the index cross).
+        # Tracked-wing premium series for the dual-bleed read, plus their own 5/9
+        # EMAs for the gamma-ignition front-run (premium cross leads the index
+        # cross). The wings are nearest-ITM under confluence_5m (the ITM-only
+        # mandate), ATM-nearest legacy; the deque names are historical.
         self._atm_call: deque[float] = deque(maxlen=self.cfg.premium_history)
         self._atm_put: deque[float] = deque(maxlen=self.cfg.premium_history)
-        self._call_ema = EmaTracker(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.ema_trend)
-        self._put_ema = EmaTracker(self.cfg.ema_fast, self.cfg.ema_slow, self.cfg.ema_trend)
+        self._call_ema = EmaTracker(self.cfg.ema_fast, self.cfg.ema_slow, trend)
+        self._put_ema = EmaTracker(self.cfg.ema_fast, self.cfg.ema_slow, trend)
         self._contracts: list[ContractQuote] = []
         self._last_bar_ts: dt.datetime | None = None
+        # 5m aggregation state (confluence_5m): the forming bucket + the engine's
+        # own closed-5m-bar tape (MarketState stays 1m for everything else).
+        self._agg: list | None = None            # [ts, open, high, low, close, vol]
+        self._agg_key: dt.datetime | None = None
+        self._bars5: deque[Bar] = deque(maxlen=120)
+
+    # -- 5m folding (confluence_5m) ----------------------------------------- #
+    #
+    # 5m confirms later than 1m (more lag, less noise) — INTENTIONAL: reliability
+    # over earliness is what buys this confluence its PRIMARY weight in the gate.
+
+    @property
+    def _chop_window(self) -> int:
+        """Chop window in minutes, scaled with the bar timeframe — 5m bars cross
+        ~5× less often, so the same 3-cross signature needs a 5× wider window."""
+        return self.cfg.chop_window_min * (
+            self.cfg.bar_minutes if self.cfg.confluence_5m else 1
+        )
+
+    def _bucket_start(self, ts: dt.datetime) -> dt.datetime:
+        """Clock-aligned bucket a 1m bar belongs to. Tape bars are stamped at
+        CLOSE time, so the :30–:35 chart candle is the bars stamped :31…:35 —
+        shift back one minute before flooring."""
+        shifted = ts - dt.timedelta(minutes=1)
+        floor_min = (shifted.minute // self.cfg.bar_minutes) * self.cfg.bar_minutes
+        return shifted.replace(minute=floor_min, second=0, microsecond=0)
+
+    def _close_bucket(self) -> Bar:
+        ts, o, h, l, c, v = self._agg
+        self._agg = None
+        self._agg_key = None
+        b5 = Bar(ts=ts, open=o, high=h, low=l, close=c, volume=v)
+        self._bars5.append(b5)
+        return b5
+
+    def _fold(self, bar: Bar) -> list[Bar]:
+        """Fold a 1m tape bar into the 5m series. Returns the 5m bars this push
+        COMPLETED — normally 0 or 1; 2 only when a tape gap left a stale bucket
+        to flush first. A bar whose close-stamp minute is divisible by the
+        timeframe is its bucket's FINAL bar, so the 5m bar closes on it
+        immediately (zero lag beyond the 5m boundary itself)."""
+        out: list[Bar] = []
+        key = self._bucket_start(bar.ts)
+        if self._agg is not None and key != self._agg_key:
+            out.append(self._close_bucket())  # gap fallback: flush the stale bucket
+        if self._agg is None:
+            self._agg_key = key
+            self._agg = [bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume]
+        else:
+            a = self._agg
+            a[0] = bar.ts
+            a[2] = max(a[2], bar.high)
+            a[3] = min(a[3], bar.low)
+            a[4] = bar.close
+            a[5] += bar.volume
+        if bar.ts.minute % self.cfg.bar_minutes == 0:
+            out.append(self._close_bucket())
+        return out
 
     # -- warmup ------------------------------------------------------------ #
 
     def warm(self, bars: list[Bar]) -> None:
         """Seed the index EMAs from the backfilled tape so a mid-session restart
         doesn't start with cold EMAs (no false cross on the first live bar).
-        Records the last seen bar timestamp so `on_bar` won't reprocess it."""
-        for b in bars:
-            self.ema.update(b.close)
+        Under confluence_5m the backfill runs through the same 5m folder, so the
+        EMAs are seeded from 5m closes and a partial trailing bucket carries over
+        into the live tape. Records the last seen bar timestamp so `on_bar`
+        won't reprocess it."""
+        if self.cfg.confluence_5m:
+            for b in bars:
+                for b5 in self._fold(b):
+                    self.ema.update(b5.close)
+        else:
+            for b in bars:
+                self.ema.update(b.close)
         if bars:
             self._last_bar_ts = bars[-1].ts
 
     # -- per chain poll ---------------------------------------------------- #
 
     def on_chain(self, payload: dict[str, Any], spot: float) -> None:
-        """Cache the contract table and push the ATM call/put marks (for the
-        dual-bleed read + the premium front-run EMAs). Cheap; runs every poll."""
+        """Cache the contract table and push the tracked-wing call/put marks (for
+        the dual-bleed read + the premium front-run EMAs). Cheap; runs every poll.
+
+        Deliberately NOT folded to 5m: the premium EMAs are a BOOSTER read (the
+        contract's own tape front-running the index), not ignition logic — on 5m
+        closes they'd need ~45 min to mature and be dead most of the session.
+        Only the index trigger/bar-close logic moves to 5m (Task 2)."""
         self._contracts = extract_contracts(payload)
         if spot <= 0 or not self._contracts:
             return
         calls = [c for c in self._contracts if c.side == "call"]
         puts = [c for c in self._contracts if c.side == "put"]
-        atm_call = min(calls, key=lambda c: abs(c.strike - spot), default=None)
-        atm_put = min(puts, key=lambda c: abs(c.strike - spot), default=None)
-        if atm_call is not None and atm_call.premium > 0:
-            self._atm_call.append(atm_call.premium)
-            self._call_ema.update(atm_call.premium)
-        if atm_put is not None and atm_put.premium > 0:
-            self._atm_put.append(atm_put.premium)
-            self._put_ema.update(atm_put.premium)
+        if self.cfg.confluence_5m:
+            # ITM-only mandate: track the nearest-ITM wings (call at/below spot,
+            # put at/above), so dual-bleed / front-run / divergence read ITM premium.
+            track_call = max((c for c in calls if c.strike <= spot),
+                             key=lambda c: c.strike, default=None)
+            track_put = min((p for p in puts if p.strike >= spot),
+                            key=lambda p: p.strike, default=None)
+        else:
+            track_call = min(calls, key=lambda c: abs(c.strike - spot), default=None)
+            track_put = min(puts, key=lambda c: abs(c.strike - spot), default=None)
+        if track_call is not None and track_call.premium > 0:
+            self._atm_call.append(track_call.premium)
+            self._call_ema.update(track_call.premium)
+        if track_put is not None and track_put.premium > 0:
+            self._atm_put.append(track_put.premium)
+            self._put_ema.update(track_put.premium)
 
     # -- per bar ----------------------------------------------------------- #
 
@@ -415,8 +516,10 @@ class ScalpEngine:
         vanna: VannaReading | None,
         charm: CharmProfile | None,
     ) -> ScalpReading:
-        """Update the index EMAs with the latest closed bar and evaluate the
-        trigger + gate stack into a `ScalpReading`."""
+        """Feed the latest closed 1m tape bar. Legacy evaluates every bar; under
+        `confluence_5m` the bar is folded into the 5m series and the trigger +
+        gate stack evaluates only on a 5m CLOSE — in-between bars just surface
+        the live EMA state for the board."""
         if not state.bars:
             return ScalpReading()
         cur = state.bars[-1]
@@ -425,11 +528,49 @@ class ScalpEngine:
             return self._inactive()
         self._last_bar_ts = cur.ts
 
+        if not self.cfg.confluence_5m:
+            # Legacy 1m path: every tape bar is an evaluation bar.
+            return self._evaluate(state, list(state.bars), cur, gex, vanna, charm)
+
+        # Task-2 5m mode: ALL ignition/cross/bar-close logic runs on the 5m
+        # closes. 5m confirms later than 1m (more lag, less noise) — intentional:
+        # reliability over earliness is what buys this confluence its PRIMARY
+        # weight in the candidate gate.
+        completed = self._fold(cur)
+        if not completed:
+            # Bucket still forming — a fresh trigger can only exist on a 5m close.
+            return ScalpReading(
+                cross_type="none",
+                ema_fast=self.ema.fast.value,
+                ema_slow=self.ema.slow.value,
+                ema_trend=self.ema.trend.value,
+                chop_count=self.chop.count(cur.ts, self._chop_window),
+                note="5m bar forming — triggers evaluate on the 5m close",
+            )
+        reading = self._inactive()
+        for b5 in completed:  # >1 only after a tape gap flushed a stale bucket
+            reading = self._evaluate(state, list(self._bars5), b5, gex, vanna, charm)
+        return reading
+
+    def _evaluate(
+        self,
+        state: MarketState,
+        bars: list[Bar],
+        cur: Bar,
+        gex: GexProfile | None,
+        vanna: VannaReading | None,
+        charm: CharmProfile | None,
+    ) -> ScalpReading:
+        """The trigger + gate stack on one evaluation bar (a 1m tape bar legacy,
+        a folded 5m close otherwise). `bars` is the evaluation-timeframe tape —
+        used for the reclaim window and premium divergence — while session
+        structure (VWAP confirm, key-level targets) always reads the 1m
+        MarketState."""
         self.ema.update(cur.close)
         if self.ema.cross_up or self.ema.cross_dn:
             self.chop.record(cur.ts)
 
-        reclaim_up, reclaim_dn = self._reclaim(state)
+        reclaim_up, reclaim_dn = self._reclaim(bars)
 
         if self.ema.cross_up or reclaim_up:
             direction: Direction | None = Direction.BULLISH
@@ -453,7 +594,7 @@ class ScalpEngine:
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 ema_trend=ema_trend,
-                chop_count=self.chop.count(cur.ts, self.cfg.chop_window_min),
+                chop_count=self.chop.count(cur.ts, self._chop_window),
                 note="no fresh 5/9 cross or reclaim",
             )
 
@@ -469,7 +610,7 @@ class ScalpEngine:
         target_level, room = self._target_level(state, gex, charm, direction, spot, ema_trend)
         room_ok = room >= self.cfg.min_room_pts
 
-        chop_count = self.chop.count(cur.ts, self.cfg.chop_window_min)
+        chop_count = self.chop.count(cur.ts, self._chop_window)
         in_chop = chop_count >= self.cfg.chop_max_crosses
         chop_ok = not in_chop
 
@@ -488,7 +629,7 @@ class ScalpEngine:
             self._call_ema.bull_stack if direction is Direction.BULLISH
             else self._put_ema.bull_stack
         )
-        premium_div = self._premium_divergence(state, direction)
+        premium_div = self._premium_divergence(bars, direction)
 
         # Gate 0 (regime) is no longer a HARD block: momentum may fire in high-
         # positive GEX too — it's just flagged as a dealer-damped "slow grind" for
@@ -542,18 +683,19 @@ class ScalpEngine:
             ema_trend=self.ema.trend.value,
         )
 
-    def _reclaim(self, state: MarketState) -> tuple[bool, bool]:
+    def _reclaim(self, bars: list[Bar]) -> tuple[bool, bool]:
         """Reclaim of the 5 EMA off a local bottom/top (higher quality than a raw
         cross — it has a defined invalidation). Bullish: the prior bar closed
         below the 5 EMA, this bar closes back above it, and price has bounced off a
         recent local low. Mirror for bearish. Needs the prior fast EMA value the
-        tracker just snapshotted."""
-        if self.ema.prev_fast is None or self.ema.fast.value is None or len(state.bars) < 3:
+        tracker just snapshotted. `bars` is the evaluation-timeframe tape (1m
+        legacy, the folded 5m series otherwise)."""
+        if self.ema.prev_fast is None or self.ema.fast.value is None or len(bars) < 3:
             return False, False
-        cur = state.bars[-1]
-        prev = state.bars[-2]
+        cur = bars[-1]
+        prev = bars[-2]
         k = self.cfg.reclaim_lookback_bars
-        window = [b.close for b in list(state.bars)[-(k + 1):-1]]  # exclude current
+        window = [b.close for b in bars[-(k + 1):-1]]  # exclude current
         if not window:
             return False, False
         reclaim_up = (
@@ -625,12 +767,13 @@ class ScalpEngine:
             room = (spot - nearest.price) if nearest else float("inf")
         return nearest, room
 
-    def _premium_divergence(self, state: MarketState, direction: Direction) -> bool:
+    def _premium_divergence(self, bars: list[Bar], direction: Direction) -> bool:
         """Booster: the contract refuses to confirm the index's extreme. Bullish —
-        the index prints a lower low while the ATM call premium prints a higher low
-        (vega being bid into the reversal). Bearish mirror on the put."""
+        the index prints a lower low while the tracked call premium prints a higher
+        low (vega being bid into the reversal). Bearish mirror on the put. `bars`
+        is the evaluation-timeframe tape (1m legacy, 5m otherwise)."""
         k = self.cfg.dual_bleed_lookback
-        idx = [b.close for b in list(state.bars)[-(2 * k):]]
+        idx = [b.close for b in bars[-(2 * k):]]
         if direction is Direction.BULLISH:
             return _lower_low(idx) and _higher_low(list(self._atm_call))
         return _higher_high(idx) and _higher_low(list(self._atm_put))
@@ -642,6 +785,8 @@ class ScalpEngine:
     ) -> str:
         d = direction.value
         trig = "5/9 cross" if cross_type == "cross" else "5 EMA reclaim"
+        if self.cfg.confluence_5m:
+            trig = f"5m {trig}"
         parts = [f"{d} {trig}", f"regime {regime_tag}"]
         if target_level is not None:
             parts.append(f"target {target_level.label} @ {target_level.price:.0f} ({room:.1f}pt)")

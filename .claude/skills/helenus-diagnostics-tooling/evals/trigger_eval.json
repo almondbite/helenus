@@ -1,0 +1,23 @@
+[
+  {"query": "what would the gate have fired on yesterday's session", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "pull today's tape so we can analyze it offline", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "grade today's alerts against the real tape", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "how noisy is the liq_reject trigger on real data", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "run ingest_today to close the loop", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "how do I query a specific alert out of the jsonl", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "what does !stats actually show", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "where do the tape files land and are they committed", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "which board shows stream freshness", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "can replay_gate test the volume confirmation trigger", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "measure how many zone spawns we'd get at min_score 45", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "the gate missed obvious setups today, prove it", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "resend the alert that failed to post", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "how do I check the discord channel wiring", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "do the replay counts mean the trigger is profitable", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "why is the stream stale", "should_trigger": false, "expected_skill": "helenus-debugging-playbook"},
+  {"query": "what is grade_today.py - never seen it", "should_trigger": true, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "profile my numpy code for performance", "should_trigger": false, "expected_skill": null},
+  {"query": "run the full validation campaign", "should_trigger": false, "expected_skill": "helenus-confluence-validation-campaign"},
+  {"query": "add a new !command to the bot", "should_trigger": false, "expected_skill": "helenus-change-control"},
+  {"query": "set up grafana dashboards for my server", "should_trigger": false, "expected_skill": null}
+]

@@ -1,0 +1,23 @@
+[
+  {"query": "test_gexmap assertion failed: expected 7450 got 7448.3", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "should I just update the expected value in the fixture", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "write tests for the new engine I'm adding", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "what do the legacy_gex context managers do", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "all tests green, can I claim no regression?", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "review the tests/ changes in this diff", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "is the websocket covered by tests", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "how are the fixtures constructed, can I generate them?", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "does a green test_sq9 mean the pine port is faithful", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "my change needs test_scalp edited to pass, thoughts", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "what test tiers exist here", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "how do I test the 5m fold logic without a live feed", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "add a regression test for the bug we just found", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "what can't a passing unit test tell us", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"},
+  {"query": "tests wont even import, PYTHONPATH thing?", "should_trigger": false, "expected_skill": "helenus-build-test-env"},
+  {"query": "tests pass so ship the weight change", "should_trigger": false, "expected_skill": "helenus-research-discipline"},
+  {"query": "why do we test engines and not the bot loop", "should_trigger": false, "expected_skill": "helenus-architecture-contract"},
+  {"query": "write jest tests for my react component", "should_trigger": false, "expected_skill": null},
+  {"query": "what coverage tool should I use in general", "should_trigger": false, "expected_skill": null},
+  {"query": "replay the tape to sanity check the gate", "should_trigger": false, "expected_skill": "helenus-diagnostics-tooling"},
+  {"query": "is editing a legacy-pinned test allowed", "should_trigger": true, "expected_skill": "helenus-validation-and-qa"}
+]

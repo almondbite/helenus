@@ -18,7 +18,10 @@ from helenus.engine.charm import CharmProfile
 from helenus.engine.flow import VannaReading, VolumeProfile
 from helenus.engine.gex import GexProfile
 from helenus.engine.intermarket import IntermarketProfile
+from helenus.engine.conviction import ConvictionReading
 from helenus.engine.scalp import ScalpReading
+from helenus.engine.sq9 import Sq9Reading
+from helenus.engine.zones import ZoneReading
 from helenus.engine.displacement import DisplacementReading
 from helenus.engine.orb import ORBReading
 from helenus.engine.moc import MocReading
@@ -314,6 +317,31 @@ def watch_embed(
     return _fit(embed)
 
 
+def regime_flip_embed(note: str, gex: GexProfile | None = None) -> discord.Embed:
+    """Muted regime-router note (Task-1 GEX decoupling): spot crossed the zero-Γ
+    pivot, so the gamma SIGN — the momentum-vs-reversion label — just changed.
+    Informational like the WATCH: grey, no trade plan, never journaled or graded.
+    The levels themselves stay a manual read off the !gex board."""
+    embed = discord.Embed(
+        title="🧭 REGIME — gamma sign flipped",
+        description=_clip(
+            f"• {note}\n"
+            "• _Regime label only — momentum (negative Γ) vs reversion (positive Γ). "
+            "Not a signal; read the gamma board manually._",
+            _DESC_MAX,
+        ),
+        color=COLOR_INFO,
+        timestamp=now_et(),
+    )
+    if gex is not None:
+        zg = f"{gex.zero_gamma:.0f}" if gex.zero_gamma is not None else "n/a"
+        _field(embed, "Spot", f"{gex.spot:.2f}", inline=True)
+        _field(embed, "Zero Gamma", zg, inline=True)
+        _field(embed, "Net GEX", _fmt_gex(gex.total_net_gex), inline=True)
+    embed.set_footer(text=_footer())
+    return _fit(embed)
+
+
 def volume_profile_embed(
     vp: VolumeProfile, vanna: VannaReading | None = None
 ) -> discord.Embed:
@@ -417,6 +445,106 @@ def gex_snapshot_embed(gex: GexProfile) -> discord.Embed:
             "\n".join(f"`{k:.0f}` — {_fmt_gex(v)}" for k, v in gex.put_walls),
             inline=True,
         )
+    embed.set_footer(text=_footer())
+    return _fit(embed)
+
+
+def sq9_snapshot_embed(sq9: Sq9Reading) -> discord.Embed:
+    """Informational Gann Square-of-9 lattice board — modifier + exit grid only
+    (it neither initiates nor vetoes), so no directional claim: grey."""
+    embed = discord.Embed(
+        title="Gann Square-of-9 — Level Lattice",
+        description=_clip(
+            "_Confluence modifier + exit grid only — a ring matters when price "
+            "REACTS at it; it never fires or kills a setup on its own._",
+            _DESC_MAX,
+        ),
+        color=COLOR_INFO,
+        timestamp=now_et(),
+    )
+    _field(embed, "Anchor", f"`{sq9.grid.anchor:.2f}` ({sq9.grid.anchor_kind})", inline=True)
+    _field(embed, "Spot", f"`{sq9.spot:.2f}`", inline=True)
+    # Ring ladder around spot (3 up / 3 down), with session hold counts.
+    above = [lv for lv in sq9.grid.levels if lv.price > sq9.spot][:3]
+    below = [lv for lv in sq9.grid.levels if lv.price < sq9.spot][-3:]
+    def _row(lv) -> str:
+        held = sq9.count_at(lv)
+        tag = f" — held {held}×" if held else ""
+        return f"`{lv.price:>9.2f}`  {lv.degrees:+.0f}° ({lv.price - sq9.spot:+.1f}pt){tag}"
+    ladder = [_row(lv) for lv in reversed(above)]
+    ladder.append(f"`{sq9.spot:>9.2f}`  ← spot")
+    ladder += [_row(lv) for lv in reversed(below)]
+    _field(embed, "Ring Ladder", "\n".join(ladder))
+    if sq9.reaction is not None:
+        rx = sq9.reaction
+        _field(
+            embed,
+            "Reaction (this bar)",
+            f"{rx.kind} hold at `{rx.level.price:.2f}` ({rx.level.degrees:+.0f}°) "
+            f"→ {rx.direction.value}",
+        )
+    embed.set_footer(text=_footer())
+    return _fit(embed)
+
+
+def conviction_snapshot_embed(conv: ConvictionReading) -> discord.Embed:
+    """Displacement-conviction oscillator board — the ported signed score.
+    Green/red by the winning side (it IS a directional strength read); the
+    score enriches candidates, it doesn't fire them (LIQ_REJECT excepted)."""
+    color = COLOR_BULL if conv.conv_signed > 0 else COLOR_BEAR if conv.conv_signed < 0 else COLOR_INFO
+    embed = discord.Embed(
+        title="Displacement Conviction — signed score",
+        color=color,
+        timestamp=now_et(),
+    )
+    _field(embed, "Conviction", f"`{conv.conv_signed:+.0f}`  ({conv.tier})", inline=True)
+    _field(embed, "Bull / Bear", f"`{conv.score_bull:.0f}` / `{conv.score_bear:.0f}`", inline=True)
+    fire = "▲ BULL" if conv.fire_bull else "▼ BEAR" if conv.fire_bear else "—"
+    _field(embed, "Fire", fire, inline=True)
+    if conv.liq_rej_bull or conv.liq_rej_bear:
+        side = "BULL (swept low, closed back in)" if conv.liq_rej_bull else "BEAR (swept high, closed back in)"
+        _field(embed, "Liquidity Sweep Reject", side)
+    winning = conv.components["bull"] if conv.conv_signed >= 0 else conv.components["bear"]
+    top = sorted(
+        ((k, v) for k, v in winning.items() if k != "raw_dir" and isinstance(v, (int, float))),
+        key=lambda kv: -abs(kv[1]),
+    )[:6]
+    _field(embed, "Top factors", "\n".join(f"`{k:>8s}`  {v:+.1f}" for k, v in top))
+    nf = f"{conv.net_flow:+,.0f} ES" if conv.net_flow is not None else "n/a (stream off)"
+    _field(embed, "Net flow", nf, inline=True)
+    _field(embed, "MTF ladder", f"{conv.mtf_sum:+d}", inline=True)
+    if conv.degraded:
+        _field(embed, "Degraded inputs", "\n".join(f"• {d}" for d in conv.degraded))
+    embed.set_footer(text=_footer())
+    return _fit(embed)
+
+
+def zones_snapshot_embed(zones: ZoneReading) -> discord.Embed:
+    """Displacement zone/FVG lifecycle board — persistent structure, grey (no
+    directional claim; zones inform, they never fire)."""
+    embed = discord.Embed(
+        title="Displacement Zones — lifecycle",
+        description=_clip(f"_{zones.note}_", _DESC_MAX),
+        color=COLOR_INFO,
+        timestamp=now_et(),
+    )
+    _field(embed, "Relation", zones.relation, inline=True)
+    _field(embed, "Active / Tested", f"`{zones.n_active}` / `{zones.n_tested}`", inline=True)
+    if zones.zones:
+        rows = [
+            f"`{'▲' if z.is_bull else '▼'} {z.bottom:>8.2f}-{z.top:<8.2f}` "
+            f"{z.state:<9s} eff `{z.effective:.0f}` ·{z.touches}"
+            for z in list(zones.zones)[-8:]
+        ]
+        _field(embed, "Zones (newest last)", "\n".join(rows))
+    if zones.fvgs:
+        rows = [
+            f"`{'▲' if f.is_bull else '▼'} {f.bottom:>8.2f}-{f.top:<8.2f}` {f.state}"
+            for f in list(zones.fvgs)[-6:]
+        ]
+        _field(embed, "FVGs", "\n".join(rows))
+    if zones.degraded:
+        _field(embed, "Degraded inputs", "\n".join(f"• {d}" for d in zones.degraded))
     embed.set_footer(text=_footer())
     return _fit(embed)
 
